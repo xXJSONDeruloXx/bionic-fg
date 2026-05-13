@@ -20,6 +20,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -112,11 +113,15 @@ struct DeviceData {
     PFN_vkGetSwapchainImagesKHR    getSwapchainImages     = nullptr;
     PFN_vkQueuePresentKHR          queuePresent           = nullptr;
     PFN_vkAcquireNextImageKHR      acquireNextImage       = nullptr;
+    PFN_vkAcquireNextImage2KHR     acquireNextImage2      = nullptr;
+    PFN_vkGetDeviceQueue           getDeviceQueue         = nullptr;
+    PFN_vkGetDeviceQueue2          getDeviceQueue2        = nullptr;
     PFN_vkQueueSubmit              queueSubmit            = nullptr;
     PFN_vkDeviceWaitIdle           deviceWaitIdle         = nullptr;
     PFN_vkCreateCommandPool        createCmdPool          = nullptr;
     PFN_vkDestroyCommandPool       destroyCmdPool         = nullptr;
     PFN_vkAllocateCommandBuffers   allocCmdBufs           = nullptr;
+    PFN_vkResetCommandBuffer       resetCmdBuf            = nullptr;
     PFN_vkBeginCommandBuffer       beginCmdBuf            = nullptr;
     PFN_vkEndCommandBuffer         endCmdBuf              = nullptr;
     PFN_vkCmdPipelineBarrier       cmdPipelineBarrier     = nullptr;
@@ -146,6 +151,8 @@ struct ExtImage {
     VkImage        img  = VK_NULL_HANDLE;
     VkDeviceMemory mem  = VK_NULL_HANDLE;
     VkImageView    view = VK_NULL_HANDLE;
+    VkImageLayout  layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bool           externalOwner = false;
 };
 
 #ifdef __ANDROID__
@@ -249,16 +256,23 @@ struct SwapState {
 
     // Copy cmd infrastructure (on producer device)
     VkCommandPool   copyPool   = VK_NULL_HANDLE;
+    uint32_t        copyQueueFamily = VK_QUEUE_FAMILY_IGNORED;
     VkCommandBuffer copyCmds[2]= {};
     VkFence         copyFences[2]={};
-    VkSemaphore     genSems[4] = {};    // one per possible generated frame
+    VkCommandBuffer genCmds[4] = {};    // one per possible generated frame
+    VkFence         genFences[4] = {};
+    VkSemaphore     acquireSems[4] = {};
+    VkSemaphore     presentSems[4] = {};
 
     uint64_t frameCount = 0;
     bool     inPresent  = false;
 
     void cleanup(const DeviceData& dd, VkDevice dev) {
-        for (auto& s : genSems) if (s) dd.destroySemaphore(dev, s, nullptr);
-        for (auto& f : copyFences) if (f) dd.destroyFence(dev, f, nullptr);
+        if (dd.deviceWaitIdle) dd.deviceWaitIdle(dev);
+        for (auto& s : acquireSems) if (s) { dd.destroySemaphore(dev, s, nullptr); s = VK_NULL_HANDLE; }
+        for (auto& s : presentSems) if (s) { dd.destroySemaphore(dev, s, nullptr); s = VK_NULL_HANDLE; }
+        for (auto& f : copyFences) if (f) { dd.destroyFence(dev, f, nullptr); f = VK_NULL_HANDLE; }
+        for (auto& f : genFences) if (f) { dd.destroyFence(dev, f, nullptr); f = VK_NULL_HANDLE; }
         if (copyPool) dd.destroyCmdPool(dev, copyPool, nullptr);
         // Free AHB images on producer device
         freeExtImage(dd, dev, prevProducerImg);
@@ -267,10 +281,12 @@ struct SwapState {
         // Destroy framegen context (frees its own device)
         if (fgCtx) { fgCtx->destroy(); fgCtx.reset(); }
         // Release AHBs
-        if (prevAhb) AHardwareBuffer_release(prevAhb);
-        if (currAhb) AHardwareBuffer_release(currAhb);
-        for (auto* ahb : outAhbs) AHardwareBuffer_release(ahb);
+        if (prevAhb) { AHardwareBuffer_release(prevAhb); prevAhb = nullptr; }
+        if (currAhb) { AHardwareBuffer_release(currAhb); currAhb = nullptr; }
+        for (auto* ahb : outAhbs) if (ahb) AHardwareBuffer_release(ahb);
+        outAhbs.clear(); outProducerImgs.clear();
         copyPool = VK_NULL_HANDLE;
+        copyQueueFamily = VK_QUEUE_FAMILY_IGNORED;
     }
 #endif
 };
@@ -281,6 +297,8 @@ static std::mutex g_mtx;
 static std::unordered_map<void*, InstanceData> g_instances;
 static std::unordered_map<void*, DeviceData>   g_devices;
 static std::unordered_map<VkPhysicalDevice, VkInstance> g_physInstances;
+struct QueueData { void* deviceKey = nullptr; uint32_t family = VK_QUEUE_FAMILY_IGNORED; };
+static std::unordered_map<VkQueue, QueueData> g_queues;
 static std::unordered_map<VkSwapchainKHR, SwapState> g_swapchains;
 static std::unordered_map<VkSwapchainKHR, void*>     g_swapDevice;
 
@@ -290,15 +308,17 @@ static void layerImageBarrier(const DeviceData& dd, VkCommandBuffer cmd,
         VkImage img,
         VkPipelineStageFlags srcStage, VkAccessFlags srcAccess,
         VkPipelineStageFlags dstStage, VkAccessFlags dstAccess,
-        VkImageLayout oldLayout, VkImageLayout newLayout) {
+        VkImageLayout oldLayout, VkImageLayout newLayout,
+        uint32_t srcQueueFamily = VK_QUEUE_FAMILY_IGNORED,
+        uint32_t dstQueueFamily = VK_QUEUE_FAMILY_IGNORED) {
     VkImageMemoryBarrier b{};
     b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     b.srcAccessMask       = srcAccess;
     b.dstAccessMask       = dstAccess;
     b.oldLayout           = oldLayout;
     b.newLayout           = newLayout;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.srcQueueFamilyIndex = srcQueueFamily;
+    b.dstQueueFamilyIndex = dstQueueFamily;
     b.image               = img;
     b.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     dd.cmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
@@ -460,11 +480,15 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateDevice(
     dd.getSwapchainImages   = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(load("vkGetSwapchainImagesKHR"));
     dd.queuePresent         = reinterpret_cast<PFN_vkQueuePresentKHR>(load("vkQueuePresentKHR"));
     dd.acquireNextImage     = reinterpret_cast<PFN_vkAcquireNextImageKHR>(load("vkAcquireNextImageKHR"));
+    dd.acquireNextImage2    = reinterpret_cast<PFN_vkAcquireNextImage2KHR>(load("vkAcquireNextImage2KHR"));
+    dd.getDeviceQueue       = reinterpret_cast<PFN_vkGetDeviceQueue>(load("vkGetDeviceQueue"));
+    dd.getDeviceQueue2      = reinterpret_cast<PFN_vkGetDeviceQueue2>(load("vkGetDeviceQueue2"));
     dd.queueSubmit          = reinterpret_cast<PFN_vkQueueSubmit>(load("vkQueueSubmit"));
     dd.deviceWaitIdle       = reinterpret_cast<PFN_vkDeviceWaitIdle>(load("vkDeviceWaitIdle"));
     dd.createCmdPool        = reinterpret_cast<PFN_vkCreateCommandPool>(load("vkCreateCommandPool"));
     dd.destroyCmdPool       = reinterpret_cast<PFN_vkDestroyCommandPool>(load("vkDestroyCommandPool"));
     dd.allocCmdBufs         = reinterpret_cast<PFN_vkAllocateCommandBuffers>(load("vkAllocateCommandBuffers"));
+    dd.resetCmdBuf          = reinterpret_cast<PFN_vkResetCommandBuffer>(load("vkResetCommandBuffer"));
     dd.beginCmdBuf          = reinterpret_cast<PFN_vkBeginCommandBuffer>(load("vkBeginCommandBuffer"));
     dd.endCmdBuf            = reinterpret_cast<PFN_vkEndCommandBuffer>(load("vkEndCommandBuffer"));
     dd.cmdPipelineBarrier   = reinterpret_cast<PFN_vkCmdPipelineBarrier>(load("vkCmdPipelineBarrier"));
@@ -499,11 +523,64 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateDevice(
 VKAPI_ATTR void VKAPI_CALL BionicFG_DestroyDevice(
         VkDevice device, const VkAllocationCallbacks* pAllocator) {
     std::lock_guard<std::mutex> lk(g_mtx);
-    auto it = g_devices.find(dispatchKey(device));
+    void* devKey = dispatchKey(device);
+    for (auto itq = g_queues.begin(); itq != g_queues.end(); ) {
+        itq = (itq->second.deviceKey == devKey) ? g_queues.erase(itq) : std::next(itq);
+    }
+    auto it = g_devices.find(devKey);
     if (it != g_devices.end()) {
         it->second.destroyDevice(device, pAllocator);
         g_devices.erase(it);
     }
+}
+
+VKAPI_ATTR void VKAPI_CALL BionicFG_GetDeviceQueue(
+        VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex,
+        VkQueue* pQueue) {
+    DeviceData dd;
+    void* devKey = dispatchKey(device);
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto it = g_devices.find(devKey);
+        if (it == g_devices.end() || !it->second.getDeviceQueue) return;
+        dd = it->second;
+    }
+    dd.getDeviceQueue(device, queueFamilyIndex, queueIndex, pQueue);
+    if (pQueue && *pQueue) {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_queues[*pQueue] = QueueData{devKey, queueFamilyIndex};
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL BionicFG_GetDeviceQueue2(
+        VkDevice device, const VkDeviceQueueInfo2* pQueueInfo, VkQueue* pQueue) {
+    DeviceData dd;
+    void* devKey = dispatchKey(device);
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto it = g_devices.find(devKey);
+        if (it == g_devices.end() || !it->second.getDeviceQueue2) return;
+        dd = it->second;
+    }
+    dd.getDeviceQueue2(device, pQueueInfo, pQueue);
+    if (pQueueInfo && pQueue && *pQueue) {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_queues[*pQueue] = QueueData{devKey, pQueueInfo->queueFamilyIndex};
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL BionicFG_AcquireNextImage2KHR(
+        VkDevice device, const VkAcquireNextImageInfoKHR* pAcquireInfo,
+        uint32_t* pImageIndex) {
+    DeviceData dd;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto it = g_devices.find(dispatchKey(device));
+        if (it == g_devices.end() || !it->second.acquireNextImage2)
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        dd = it->second;
+    }
+    return dd.acquireNextImage2(device, pAcquireInfo, pImageIndex);
 }
 
 // ─── CreateSwapchainKHR ───────────────────────────────────────────────────────
@@ -580,7 +657,8 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
             d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
             d.usage  = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER
                      | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
-            AHardwareBuffer_allocate(&d, out);
+            if (AHardwareBuffer_allocate(&d, out) != 0 || !*out)
+                throw std::runtime_error("failed to allocate AHardwareBuffer");
         };
         allocAhb(&st.prevAhb);
         allocAhb(&st.currAhb);
@@ -598,13 +676,19 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
                                            | VK_IMAGE_USAGE_STORAGE_BIT;
         st.prevProducerImg = importAhb(dd, device, st.prevAhb, {W,H}, VK_FORMAT_R8G8B8A8_UNORM, copyUsage);
         st.currProducerImg = importAhb(dd, device, st.currAhb, {W,H}, VK_FORMAT_R8G8B8A8_UNORM, copyUsage);
-        for (int k = 0; k < N; ++k)
+        if (!st.prevProducerImg.img || !st.currProducerImg.img)
+            throw std::runtime_error("failed to import input AHBs on producer device");
+        for (int k = 0; k < N; ++k) {
             st.outProducerImgs.push_back(importAhb(dd, device, st.outAhbs[size_t(k)], {W,H}, VK_FORMAT_R8G8B8A8_UNORM, outUsage));
+            if (!st.outProducerImgs.back().img)
+                throw std::runtime_error("failed to import output AHB on producer device");
+        }
 
         // Create copy command pool
         VkCommandPoolCreateInfo cpci{};
         cpci.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         cpci.queueFamilyIndex = dd.queueFamilyIdx;
+        st.copyQueueFamily    = dd.queueFamilyIdx;
         cpci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         dd.createCmdPool(device, &cpci, nullptr, &st.copyPool);
 
@@ -613,18 +697,30 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
         cbai.commandPool        = st.copyPool;
         cbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cbai.commandBufferCount = 2;
-        dd.allocCmdBufs(device, &cbai, st.copyCmds);
+        if (dd.allocCmdBufs(device, &cbai, st.copyCmds) != VK_SUCCESS)
+            throw std::runtime_error("failed to allocate copy command buffers");
+        cbai.commandBufferCount = 4;
+        if (dd.allocCmdBufs(device, &cbai, st.genCmds) != VK_SUCCESS)
+            throw std::runtime_error("failed to allocate generated-frame command buffers");
 
         VkFenceCreateInfo fci{};
         fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        dd.createFence(device, &fci, nullptr, &st.copyFences[0]);
-        dd.createFence(device, &fci, nullptr, &st.copyFences[1]);
+        if (dd.createFence(device, &fci, nullptr, &st.copyFences[0]) != VK_SUCCESS ||
+            dd.createFence(device, &fci, nullptr, &st.copyFences[1]) != VK_SUCCESS)
+            throw std::runtime_error("failed to create copy fences");
+        for (int k = 0; k < N && k < 4; ++k) {
+            if (dd.createFence(device, &fci, nullptr, &st.genFences[k]) != VK_SUCCESS)
+                throw std::runtime_error("failed to create generated-frame fence");
+        }
 
         VkSemaphoreCreateInfo sci{};
         sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        for (int k = 0; k < N && k < 4; ++k)
-            dd.createSemaphore(device, &sci, nullptr, &st.genSems[k]);
+        for (int k = 0; k < N && k < 4; ++k) {
+            if (dd.createSemaphore(device, &sci, nullptr, &st.acquireSems[k]) != VK_SUCCESS ||
+                dd.createSemaphore(device, &sci, nullptr, &st.presentSems[k]) != VK_SUCCESS)
+                throw std::runtime_error("failed to create generated-frame semaphores");
+        }
 
         // Create FramegenContext (uses its own device, imports AHBs)
         bionic_fg::Config cfg;
@@ -640,9 +736,12 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
         } else {
             BFG_LAYER("SwapchainState ready: %ux%u mult=%d shaders=embedded", W, H, N+1);
         }
+    } catch (const std::exception& e) {
+        BFG_LAYER_E("Exception in CreateSwapchainKHR setup — layer will passthrough: %s", e.what());
+        st.cleanup(dd, device);
     } catch (...) {
-        BFG_LAYER_E("Exception in CreateSwapchainKHR setup — layer will passthrough");
-        st.fgCtx.reset();
+        BFG_LAYER_E("Unknown exception in CreateSwapchainKHR setup — layer will passthrough");
+        st.cleanup(dd, device);
     }
 
     {
@@ -671,208 +770,323 @@ VKAPI_ATTR void VKAPI_CALL BionicFG_DestroySwapchainKHR(
         it->second.destroySwapchain(device, swapchain, pAllocator);
 }
 
+// ─── Present / acquire helpers ───────────────────────────────────────────────
+
+static bool findDeviceForQueueOrSwapchain(VkQueue queue, VkSwapchainKHR swapchain,
+                                           void** outDevKey, QueueData* outQueueData = nullptr) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    auto qit = g_queues.find(queue);
+    if (qit != g_queues.end()) {
+        if (outDevKey) *outDevKey = qit->second.deviceKey;
+        if (outQueueData) *outQueueData = qit->second;
+        return qit->second.deviceKey != nullptr;
+    }
+    auto sit = g_swapDevice.find(swapchain);
+    if (sit != g_swapDevice.end()) {
+        if (outDevKey) *outDevKey = sit->second;
+        if (outQueueData) *outQueueData = QueueData{sit->second, VK_QUEUE_FAMILY_IGNORED};
+        return sit->second != nullptr;
+    }
+    return false;
+}
+
+static VkResult callNextPresent(VkQueue queue, const VkPresentInfoKHR* presentInfo) {
+    if (!presentInfo || presentInfo->swapchainCount == 0)
+        return vkQueuePresentKHR(queue, presentInfo);
+    void* devKey = nullptr;
+    findDeviceForQueueOrSwapchain(queue, presentInfo->pSwapchains[0], &devKey, nullptr);
+    PFN_vkQueuePresentKHR nextPresent = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto dit = g_devices.find(devKey);
+        if (dit != g_devices.end()) nextPresent = dit->second.queuePresent;
+    }
+    return nextPresent ? nextPresent(queue, presentInfo) : vkQueuePresentKHR(queue, presentInfo);
+}
+
+static VkResult acquireGeneratedImage(const DeviceData& dd, VkDevice device,
+                                      VkSwapchainKHR swapchain, VkSemaphore signalSemaphore,
+                                      uint32_t* imageIndex) {
+    if (dd.acquireNextImage) {
+        return dd.acquireNextImage(device, swapchain, 0, signalSemaphore, VK_NULL_HANDLE, imageIndex);
+    }
+    if (dd.acquireNextImage2) {
+        VkAcquireNextImageInfoKHR info{};
+        info.sType      = VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR;
+        info.swapchain  = swapchain;
+        info.timeout    = 0;
+        info.semaphore  = signalSemaphore;
+        info.fence      = VK_NULL_HANDLE;
+        info.deviceMask = 1;
+        return dd.acquireNextImage2(device, &info, imageIndex);
+    }
+    return VK_ERROR_EXTENSION_NOT_PRESENT;
+}
+
 // ─── QueuePresentKHR ──────────────────────────────────────────────────────────
 
 VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
         VkQueue queue,
         const VkPresentInfoKHR* pPresentInfo) {
-    if (pPresentInfo->swapchainCount == 0)
-        goto passthrough;
-
-    {
-        void* devKey = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            auto sit = g_swapDevice.find(pPresentInfo->pSwapchains[0]);
-            if (sit != g_swapDevice.end()) devKey = sit->second;
-        }
-        if (!devKey) goto passthrough;
-
-        DeviceData dd;
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            auto dit = g_devices.find(devKey);
-            if (dit == g_devices.end()) goto passthrough;
-            dd = dit->second;
-        }
-
-        VkSwapchainKHR swapchain = pPresentInfo->pSwapchains[0];
-        uint32_t imgIdx = pPresentInfo->pImageIndices[0];
-
-        SwapState* stPtr = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            auto it = g_swapchains.find(swapchain);
-            if (it == g_swapchains.end()) goto passthrough;
-            stPtr = &it->second;
-        }
-        SwapState& st = *stPtr;
-
-        // Recursion guard
-        if (st.inPresent) goto passthrough;
-
-#ifdef __ANDROID__
-        if (!st.fgCtx || !st.conf.enabled) goto passthrough;
-
-        st.inPresent = true;
-        const uint64_t fi = st.frameCount & 1u;
-        VkDevice device = st.device;
-        const int N = st.conf.multiplier - 1;
-
-        // --- Step 1: Copy swapchain image → currProducerImg (then swap prev/curr) ---
-        dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, UINT64_MAX);
-        dd.resetFences(device, 1, &st.copyFences[fi]);
-
-        vkResetCommandBuffer(st.copyCmds[fi], 0);
-        VkCommandBufferBeginInfo cbi{};
-        cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        dd.beginCmdBuf(st.copyCmds[fi], &cbi);
-
-        VkCommandBuffer cmd = st.copyCmds[fi];
-
-        // Transition swapchain[imgIdx] → TRANSFER_SRC
-        layerImageBarrier(dd, cmd, st.images[imgIdx],
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        // Transition currProducerImg → TRANSFER_DST
-        layerImageBarrier(dd, cmd, st.currProducerImg.img,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-
-        VkImageBlit blit{};
-        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        blit.srcOffsets[1]  = {(int32_t)st.extent.width, (int32_t)st.extent.height, 1};
-        blit.dstSubresource = blit.srcSubresource;
-        blit.dstOffsets[1]  = blit.srcOffsets[1];
-        dd.cmdBlitImage(cmd, st.images[imgIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            st.currProducerImg.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            1, &blit, VK_FILTER_NEAREST);
-
-        // Restore swapchain[imgIdx] → PRESENT_SRC
-        layerImageBarrier(dd, cmd, st.images[imgIdx],
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-        // Restore currProducerImg → GENERAL
-        layerImageBarrier(dd, cmd, st.currProducerImg.img,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-
-        dd.endCmdBuf(cmd);
-
-        VkSubmitInfo si{};
-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        si.commandBufferCount = 1;
-        si.pCommandBuffers    = &cmd;
-        dd.queueSubmit(queue, 1, &si, st.copyFences[fi]);
-
-        // Wait for copy to complete before framegen reads the AHB
-        dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, UINT64_MAX);
-
-        // --- Step 2: Run framegen ---
-        if (st.frameCount > 0) {
-            st.fgCtx->present(st.prevAhb, st.currAhb);
-            st.fgCtx->waitIdle();
-
-            // --- Step 3: Inject generated frames ---
-            for (int k = 0; k < N; ++k) {
-                // Try to acquire a free swapchain image (non-blocking)
-                uint32_t genIdx = UINT32_MAX;
-                VkResult acqRes = dd.acquireNextImage(device, swapchain, 0,
-                    st.genSems[k], VK_NULL_HANDLE, &genIdx);
-                if (acqRes != VK_SUCCESS && acqRes != VK_SUBOPTIMAL_KHR) continue;
-
-                // Blit output AHB → swapchain[genIdx]
-                VkCommandBuffer genCmd = st.copyCmds[fi ^ 1];
-                vkResetCommandBuffer(genCmd, 0);
-                dd.beginCmdBuf(genCmd, &cbi);
-
-                layerImageBarrier(dd, genCmd, st.outProducerImgs[size_t(k)].img,
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                layerImageBarrier(dd, genCmd, st.images[genIdx],
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-
-                dd.cmdBlitImage(genCmd,
-                    st.outProducerImgs[size_t(k)].img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    st.images[genIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    1, &blit, VK_FILTER_LINEAR);
-
-                layerImageBarrier(dd, genCmd, st.outProducerImgs[size_t(k)].img,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-                layerImageBarrier(dd, genCmd, st.images[genIdx],
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-
-                dd.endCmdBuf(genCmd);
-
-                VkSemaphore waitSems[]   = { st.genSems[k] };
-                VkSemaphore signalSems[] = { st.genSems[k] };
-                VkPipelineStageFlags waitMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
-                VkSubmitInfo gsi{};
-                gsi.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                gsi.waitSemaphoreCount   = 1;
-                gsi.pWaitSemaphores      = waitSems;
-                gsi.pWaitDstStageMask    = &waitMask;
-                gsi.commandBufferCount   = 1;
-                gsi.pCommandBuffers      = &genCmd;
-                gsi.signalSemaphoreCount = 1;
-                gsi.pSignalSemaphores    = signalSems;
-                dd.queueSubmit(queue, 1, &gsi, VK_NULL_HANDLE);
-
-                // Present the generated frame
-                VkPresentInfoKHR genPresent{};
-                genPresent.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-                genPresent.waitSemaphoreCount = 1;
-                genPresent.pWaitSemaphores    = signalSems;
-                genPresent.swapchainCount     = 1;
-                genPresent.pSwapchains        = &swapchain;
-                genPresent.pImageIndices      = &genIdx;
-                st.inPresent = true;   // recursion guard already set
-                dd.queuePresent(queue, &genPresent);
-            }
-        }
-
-        // Swap prev/curr for next cycle (we rebind via swapFrameInputs on next pass)
-        std::swap(st.prevAhb, st.currAhb);
-        std::swap(st.prevProducerImg, st.currProducerImg);
-        st.fgCtx->updateConfig(st.fgCtx->valid()
-            ? bionic_fg::Config{st.extent.width, st.extent.height,
-                uint32_t(st.conf.multiplier), st.conf.flowScale, uint32_t(st.conf.model)}
-            : bionic_fg::Config{});
-
-        st.frameCount++;
-        st.inPresent = false;
-#endif
+    if (!pPresentInfo || pPresentInfo->swapchainCount != 1) {
+        if (pPresentInfo && pPresentInfo->swapchainCount > 1)
+            BFG_LAYER("multi-swapchain present (%u) is not transformed; passing through", pPresentInfo->swapchainCount);
+        return callNextPresent(queue, pPresentInfo);
     }
 
-passthrough:
-    // Pass through the original present
+    VkSwapchainKHR swapchain = pPresentInfo->pSwapchains[0];
+    uint32_t imgIdx = pPresentInfo->pImageIndices ? pPresentInfo->pImageIndices[0] : UINT32_MAX;
+
     void* devKey = nullptr;
+    QueueData qd{};
+    if (!findDeviceForQueueOrSwapchain(queue, swapchain, &devKey, &qd))
+        return callNextPresent(queue, pPresentInfo);
+
+    DeviceData dd;
     {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        if (pPresentInfo->swapchainCount > 0) {
-            auto sit = g_swapDevice.find(pPresentInfo->pSwapchains[0]);
-            if (sit != g_swapDevice.end()) devKey = sit->second;
-        }
-    }
-    if (devKey) {
         std::lock_guard<std::mutex> lk(g_mtx);
         auto dit = g_devices.find(devKey);
-        if (dit != g_devices.end())
-            return dit->second.queuePresent(queue, pPresentInfo);
+        if (dit == g_devices.end()) return callNextPresent(queue, pPresentInfo);
+        dd = dit->second;
     }
-    return vkQueuePresentKHR(queue, pPresentInfo);
+
+    SwapState* stPtr = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto it = g_swapchains.find(swapchain);
+        if (it == g_swapchains.end()) return callNextPresent(queue, pPresentInfo);
+        stPtr = &it->second;
+    }
+    SwapState& st = *stPtr;
+
+    if (st.inPresent || !st.conf.enabled || !st.fgCtx)
+        return callNextPresent(queue, pPresentInfo);
+    if (imgIdx >= st.images.size()) {
+        BFG_LAYER_E("present image index %u out of range (%zu); passing through", imgIdx, st.images.size());
+        return callNextPresent(queue, pPresentInfo);
+    }
+    if (qd.family != VK_QUEUE_FAMILY_IGNORED && st.copyQueueFamily != VK_QUEUE_FAMILY_IGNORED &&
+        qd.family != st.copyQueueFamily) {
+        BFG_LAYER_E("present queue family changed from %u to %u; passing through to avoid invalid command pool",
+                    st.copyQueueFamily, qd.family);
+        return callNextPresent(queue, pPresentInfo);
+    }
+
+#ifndef __ANDROID__
+    return callNextPresent(queue, pPresentInfo);
+#else
+    st.inPresent = true;
+    struct Guard { SwapState& s; ~Guard(){ s.inPresent = false; } } guard{st};
+
+    const uint32_t fi = static_cast<uint32_t>(st.frameCount & 1u);
+    VkDevice device = st.device;
+    const int N = std::min(st.conf.multiplier - 1, 4);
+    bool consumedOriginalWaits = false;
+
+    if (!dd.resetCmdBuf || !dd.beginCmdBuf || !dd.endCmdBuf || !dd.queueSubmit || !dd.waitForFences ||
+        !dd.resetFences || !dd.cmdBlitImage || !st.copyCmds[fi] || !st.copyFences[fi]) {
+        BFG_LAYER_E("copy command infrastructure incomplete; passing through");
+        return callNextPresent(queue, pPresentInfo);
+    }
+
+    // --- Step 1: Copy real swapchain image into current AHB input. The copy
+    // waits on the application's original present semaphores, so the final real
+    // present must not wait on those same binary semaphores again.
+    if (dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, UINT64_MAX) != VK_SUCCESS ||
+        dd.resetFences(device, 1, &st.copyFences[fi]) != VK_SUCCESS) {
+        BFG_LAYER_E("copy fence wait/reset failed; passing through");
+        return callNextPresent(queue, pPresentInfo);
+    }
+
+    dd.resetCmdBuf(st.copyCmds[fi], 0);
+    VkCommandBufferBeginInfo cbi{};
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (dd.beginCmdBuf(st.copyCmds[fi], &cbi) != VK_SUCCESS) {
+        BFG_LAYER_E("begin copy command buffer failed; passing through");
+        return callNextPresent(queue, pPresentInfo);
+    }
+
+    VkCommandBuffer cmd = st.copyCmds[fi];
+    layerImageBarrier(dd, cmd, st.images[imgIdx],
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    uint32_t currSrcFamily = st.currProducerImg.externalOwner ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
+    uint32_t currDstFamily = st.currProducerImg.externalOwner ? st.copyQueueFamily : VK_QUEUE_FAMILY_IGNORED;
+    layerImageBarrier(dd, cmd, st.currProducerImg.img,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        st.currProducerImg.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        currSrcFamily, currDstFamily);
+    st.currProducerImg.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    st.currProducerImg.externalOwner = false;
+
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1]  = {(int32_t)st.extent.width, (int32_t)st.extent.height, 1};
+    blit.dstSubresource = blit.srcSubresource;
+    blit.dstOffsets[1]  = blit.srcOffsets[1];
+    dd.cmdBlitImage(cmd, st.images[imgIdx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        st.currProducerImg.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &blit, VK_FILTER_NEAREST);
+
+    layerImageBarrier(dd, cmd, st.images[imgIdx],
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    layerImageBarrier(dd, cmd, st.currProducerImg.img,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+        st.copyQueueFamily, VK_QUEUE_FAMILY_EXTERNAL);
+    st.currProducerImg.layout = VK_IMAGE_LAYOUT_GENERAL;
+    st.currProducerImg.externalOwner = true;
+
+    if (dd.endCmdBuf(cmd) != VK_SUCCESS) {
+        BFG_LAYER_E("end copy command buffer failed; passing through");
+        return callNextPresent(queue, pPresentInfo);
+    }
+
+    std::vector<VkPipelineStageFlags> waitStages(pPresentInfo->waitSemaphoreCount,
+                                                 VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
+    si.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
+    si.pWaitDstStageMask = waitStages.empty() ? nullptr : waitStages.data();
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    VkResult submitRes = dd.queueSubmit(queue, 1, &si, st.copyFences[fi]);
+    if (submitRes != VK_SUCCESS) {
+        BFG_LAYER_E("copy queue submit failed: %d; passing through", submitRes);
+        return callNextPresent(queue, pPresentInfo);
+    }
+    consumedOriginalWaits = pPresentInfo->waitSemaphoreCount > 0;
+
+    VkPresentInfoKHR finalPresent = *pPresentInfo;
+    if (consumedOriginalWaits) {
+        finalPresent.waitSemaphoreCount = 0;
+        finalPresent.pWaitSemaphores = nullptr;
+    }
+
+    VkResult copyWait = dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, UINT64_MAX);
+    if (copyWait != VK_SUCCESS) {
+        BFG_LAYER_E("copy fence wait failed after submit: %d", copyWait);
+        return dd.queuePresent(queue, &finalPresent);
+    }
+
+    // --- Step 2: Run framegen after we have both previous and current inputs.
+    if (st.frameCount > 0) {
+        st.fgCtx->present(st.prevAhb, st.currAhb);
+        st.fgCtx->waitIdle();
+        for (auto& out : st.outProducerImgs) {
+            out.layout = VK_IMAGE_LAYOUT_GENERAL;
+            out.externalOwner = true;
+        }
+
+        // --- Step 3: Inject generated frames. Acquire/write/present are kept
+        // on distinct binary semaphores to avoid waiting and signaling the same
+        // semaphore in one submit.
+        for (int k = 0; k < N; ++k) {
+            if (!st.acquireSems[k] || !st.presentSems[k] || !st.genCmds[k] || !st.genFences[k])
+                continue;
+
+            uint32_t genIdx = UINT32_MAX;
+            VkResult acqRes = acquireGeneratedImage(dd, device, swapchain, st.acquireSems[k], &genIdx);
+            if (acqRes != VK_SUCCESS && acqRes != VK_SUBOPTIMAL_KHR) {
+                BFG_LAYER("generated frame acquire skipped: %d", acqRes);
+                continue;
+            }
+            if (genIdx >= st.images.size()) {
+                BFG_LAYER_E("generated image index %u out of range (%zu)", genIdx, st.images.size());
+                continue;
+            }
+
+            dd.waitForFences(device, 1, &st.genFences[k], VK_TRUE, UINT64_MAX);
+            dd.resetFences(device, 1, &st.genFences[k]);
+            VkCommandBuffer genCmd = st.genCmds[k];
+            dd.resetCmdBuf(genCmd, 0);
+            if (dd.beginCmdBuf(genCmd, &cbi) != VK_SUCCESS) {
+                BFG_LAYER_E("begin generated command buffer failed");
+                continue;
+            }
+
+            ExtImage& out = st.outProducerImgs[size_t(k)];
+            uint32_t outSrcFamily = out.externalOwner ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
+            uint32_t outDstFamily = out.externalOwner ? st.copyQueueFamily : VK_QUEUE_FAMILY_IGNORED;
+            layerImageBarrier(dd, genCmd, out.img,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                out.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                outSrcFamily, outDstFamily);
+            out.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            out.externalOwner = false;
+
+            layerImageBarrier(dd, genCmd, st.images[genIdx],
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+            dd.cmdBlitImage(genCmd,
+                out.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                st.images[genIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1, &blit, VK_FILTER_LINEAR);
+
+            layerImageBarrier(dd, genCmd, out.img,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                st.copyQueueFamily, VK_QUEUE_FAMILY_EXTERNAL);
+            out.layout = VK_IMAGE_LAYOUT_GENERAL;
+            out.externalOwner = true;
+
+            layerImageBarrier(dd, genCmd, st.images[genIdx],
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+            if (dd.endCmdBuf(genCmd) != VK_SUCCESS) {
+                BFG_LAYER_E("end generated command buffer failed");
+                continue;
+            }
+
+            VkPipelineStageFlags waitMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkSubmitInfo gsi{};
+            gsi.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            gsi.waitSemaphoreCount   = 1;
+            gsi.pWaitSemaphores      = &st.acquireSems[k];
+            gsi.pWaitDstStageMask    = &waitMask;
+            gsi.commandBufferCount   = 1;
+            gsi.pCommandBuffers      = &genCmd;
+            gsi.signalSemaphoreCount = 1;
+            gsi.pSignalSemaphores    = &st.presentSems[k];
+            VkResult genSubmit = dd.queueSubmit(queue, 1, &gsi, st.genFences[k]);
+            if (genSubmit != VK_SUCCESS) {
+                BFG_LAYER_E("generated submit failed: %d", genSubmit);
+                continue;
+            }
+
+            VkPresentInfoKHR genPresent{};
+            genPresent.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+            genPresent.waitSemaphoreCount = 1;
+            genPresent.pWaitSemaphores    = &st.presentSems[k];
+            genPresent.swapchainCount     = 1;
+            genPresent.pSwapchains        = &swapchain;
+            genPresent.pImageIndices      = &genIdx;
+            dd.queuePresent(queue, &genPresent);
+        }
+    }
+
+    std::swap(st.prevAhb, st.currAhb);
+    std::swap(st.prevProducerImg, st.currProducerImg);
+    st.fgCtx->updateConfig(bionic_fg::Config{st.extent.width, st.extent.height,
+        uint32_t(st.conf.multiplier), st.conf.flowScale, uint32_t(st.conf.model)});
+    st.frameCount++;
+
+    return dd.queuePresent(queue, &finalPresent);
+#endif
 }
 
 // ─── GetProcAddr entry points ─────────────────────────────────────────────────
@@ -882,8 +1096,11 @@ passthrough:
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL BionicFG_GetDeviceProcAddr(
         VkDevice device, const char* name) {
     HOOK(DestroyDevice);
+    HOOK(GetDeviceQueue);
+    HOOK(GetDeviceQueue2);
     HOOK(CreateSwapchainKHR);
     HOOK(DestroySwapchainKHR);
+    HOOK(AcquireNextImage2KHR);
     HOOK(QueuePresentKHR);
 
     std::lock_guard<std::mutex> lk(g_mtx);
@@ -900,8 +1117,11 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL BionicFG_GetInstanceProcAddr(
     HOOK(EnumeratePhysicalDevices);
     HOOK(CreateDevice);
     HOOK(DestroyDevice);
+    HOOK(GetDeviceQueue);
+    HOOK(GetDeviceQueue2);
     HOOK(CreateSwapchainKHR);
     HOOK(DestroySwapchainKHR);
+    HOOK(AcquireNextImage2KHR);
     HOOK(QueuePresentKHR);
     if (std::strcmp(name, "vkGetDeviceProcAddr") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(BionicFG_GetDeviceProcAddr);

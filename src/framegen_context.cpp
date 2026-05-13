@@ -173,6 +173,10 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
     const uint32_t outputs = ctx->cfg_.multiplier - 1;
 
     try {
+        if (ctx->cfg_.model == 1) {
+            BFG_LOGW("model=1 requested: using mapped model-1 warp/confidence + synthesis shaders with model-0 flow graph until the full model-1 flow graph is proven");
+        }
+
         ctx->device_        = vk::Device::create();
         ctx->cmdPool_       = vk::CommandPool(ctx->device_);
         ctx->linearSampler_ = vk::Sampler(ctx->device_, VK_FILTER_LINEAR,
@@ -224,8 +228,15 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
         ctx->flowRefinedFwd_ = vk::Image(ctx->device_, flow);
         ctx->flowRefinedBwd_ = vk::Image(ctx->device_, flow);
         ctx->flowMerged_     = vk::Image(ctx->device_, flow);
+        ctx->flowAggregated_ = vk::Image(ctx->device_, flow);
         ctx->flowExpA_       = vk::Image(ctx->device_, flow);
         ctx->flowExpB_       = vk::Image(ctx->device_, flow);
+        ctx->flowPyramid_.reserve(6);
+        for (int i = 0; i < 6; ++i) {
+            vk::ImageInfo fpi = flow;
+            fpi.extent = {std::max(1u, W >> i), std::max(1u, H >> i)};
+            ctx->flowPyramid_.emplace_back(ctx->device_, fpi);
+        }
 
         // Confidence placeholder (RGBA8 all-ones)
         vk::ImageInfo ci;
@@ -233,9 +244,10 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
         ci.usage  = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
                   | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         ctx->confidence_    = vk::Image(ctx->device_, ci);
-        ctx->warpedPrev_    = vk::Image(ctx->device_, ci);
-        ctx->warpedCurr_    = vk::Image(ctx->device_, ci);
-        ctx->confidenceMap_ = vk::Image(ctx->device_, ci);
+        ctx->warpedPrev_     = vk::Image(ctx->device_, ci);
+        ctx->warpedCurr_     = vk::Image(ctx->device_, ci);
+        ctx->confidenceMap_  = vk::Image(ctx->device_, ci);
+        ctx->model1SynthAux_ = vk::Image(ctx->device_, ci);
         clearImageWhite(ctx->device_, ctx->cmdPool_, ctx->confidence_);
 
         // ── UBOs ──────────────────────────────────────────────────────────
@@ -352,12 +364,48 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
         }
         {
             std::vector<vk::DescriptorBinding> binds = {
+                {0,  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1},
+                {32,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1},
+                {33,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1},
+                {48,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1},
+                {49,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1},
+                {50,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1},
+                {51,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1},
+                {52,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1},
+                {53,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1},
+            };
+            ctx->passFlowPyramid_ = Pass(ctx->device_, ctx->descPool_, 13, binds);
+            ctx->passFlowPyramid_.bindUBO(ctx->device_, 0, ctx->uboFlow_);
+            ctx->passFlowPyramid_.bindSampled(ctx->device_, 32, ctx->flowMerged_, ctx->linearSampler_);
+            ctx->passFlowPyramid_.bindSampled(ctx->device_, 33, ctx->featA_, ctx->linearSampler_);
+            for (int i=0;i<6;++i)
+                ctx->passFlowPyramid_.bindStorage(ctx->device_, uint32_t(48+i), ctx->flowPyramid_[size_t(i)]);
+        }
+        {
+            std::vector<vk::DescriptorBinding> binds = {
+                {0,  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1},
+                {32,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1},
+                {33,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1},
+                {34,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1},
+                {35,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1},
+                {36,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1},
+                {37,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1},
+                {48,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1},
+            };
+            ctx->passFlowAggregate_ = Pass(ctx->device_, ctx->descPool_, 25, binds);
+            ctx->passFlowAggregate_.bindUBO(ctx->device_, 0, ctx->uboFlow_);
+            for (int i=0;i<6;++i)
+                ctx->passFlowAggregate_.bindSampled(ctx->device_, uint32_t(32+i), ctx->flowPyramid_[size_t(i)], ctx->linearSampler_);
+            ctx->passFlowAggregate_.bindStorage(ctx->device_, 48, ctx->flowAggregated_);
+        }
+        {
+            std::vector<vk::DescriptorBinding> binds = {
                 {32,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1},
                 {48,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1},
                 {49,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1},
             };
             ctx->passFlowExpand_ = Pass(ctx->device_, ctx->descPool_, 30, binds);
-            ctx->passFlowExpand_.bindSampled(ctx->device_, 32, ctx->flowMerged_, ctx->linearSampler_);
+            ctx->passFlowExpand_.bindSampled(ctx->device_, 32, ctx->flowAggregated_, ctx->linearSampler_);
             ctx->passFlowExpand_.bindStorage(ctx->device_, 48, ctx->flowExpA_);
             ctx->passFlowExpand_.bindStorage(ctx->device_, 49, ctx->flowExpB_);
         }
@@ -388,7 +436,8 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
                 wbBinds.push_back({39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1});
                 wbBinds.push_back({40, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1});
             }
-            ctx->passWarpBlend_.emplace_back(ctx->device_, ctx->descPool_, model1 ? 39 : 14, wbBinds);
+            const int warpShader = model1 ? ((k & 1u) ? 44 : 39) : ((k & 1u) ? 20 : 14);
+            ctx->passWarpBlend_.emplace_back(ctx->device_, ctx->descPool_, warpShader, wbBinds);
             auto& pw = ctx->passWarpBlend_.back();
             pw.bindUBO    (ctx->device_, 0,  ctx->uboSynth_[k]);
             pw.bindSampled(ctx->device_, 32, ctx->prevFrame_,    ctx->linearSampler_);
@@ -406,24 +455,57 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
             pw.bindStorage(ctx->device_, 49, ctx->warpedCurr_);
             pw.bindStorage(ctx->device_, 50, ctx->confidenceMap_);
 
-            std::vector<vk::DescriptorBinding> binds = {
-                {0,  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-                {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                {33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                {34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                {35, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                {36, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                {48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
-            };
-            ctx->passSynth_.emplace_back(ctx->device_, ctx->descPool_, 4, binds);
-            auto& ps = ctx->passSynth_.back();
-            ps.bindUBO    (ctx->device_, 0,  ctx->uboSynth_[k]);
-            ps.bindSampled(ctx->device_, 32, ctx->prevFrame_,      ctx->linearSampler_);
-            ps.bindSampled(ctx->device_, 33, ctx->currFrame_,      ctx->linearSampler_);
-            ps.bindSampled(ctx->device_, 34, ctx->flowExpA_,       ctx->linearSampler_);
-            ps.bindSampled(ctx->device_, 35, ctx->flowExpB_,       ctx->linearSampler_);
-            ps.bindSampled(ctx->device_, 36, ctx->confidenceMap_,  ctx->linearSampler_);
-            ps.bindStorage(ctx->device_, 48, ctx->outputImages_[k]);
+            if (model1) {
+                std::vector<vk::DescriptorBinding> binds = {
+                    {0,  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+                    {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {35, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {36, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {37, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {38, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {40, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
+                    {49, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
+                };
+                ctx->passSynth_.emplace_back(ctx->device_, ctx->descPool_, 49, binds);
+                auto& ps = ctx->passSynth_.back();
+                ps.bindUBO    (ctx->device_, 0,  ctx->uboSynth_[k]);
+                ps.bindSampled(ctx->device_, 32, ctx->prevFrame_,      ctx->linearSampler_);
+                ps.bindSampled(ctx->device_, 33, ctx->currFrame_,      ctx->linearSampler_);
+                ps.bindSampled(ctx->device_, 34, ctx->flowExpA_,       ctx->linearSampler_);
+                ps.bindSampled(ctx->device_, 35, ctx->flowExpB_,       ctx->linearSampler_);
+                ps.bindSampled(ctx->device_, 36, ctx->confidenceMap_,  ctx->linearSampler_);
+                ps.bindSampled(ctx->device_, 37, ctx->warpedPrev_,     ctx->linearSampler_);
+                ps.bindSampled(ctx->device_, 38, ctx->warpedCurr_,     ctx->linearSampler_);
+                ps.bindSampled(ctx->device_, 39, ctx->flowMerged_,     ctx->linearSampler_);
+                ps.bindSampled(ctx->device_, 40, ctx->flowRefinedFwd_, ctx->linearSampler_);
+                ps.bindSampled(ctx->device_, 41, ctx->flowRefinedBwd_, ctx->linearSampler_);
+                ps.bindStorage(ctx->device_, 48, ctx->outputImages_[k]);
+                ps.bindStorage(ctx->device_, 49, ctx->model1SynthAux_);
+            } else {
+                std::vector<vk::DescriptorBinding> binds = {
+                    {0,  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+                    {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {35, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {36, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                    {48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
+                };
+                ctx->passSynth_.emplace_back(ctx->device_, ctx->descPool_, 4, binds);
+                auto& ps = ctx->passSynth_.back();
+                ps.bindUBO    (ctx->device_, 0,  ctx->uboSynth_[k]);
+                ps.bindSampled(ctx->device_, 32, ctx->prevFrame_,      ctx->linearSampler_);
+                ps.bindSampled(ctx->device_, 33, ctx->currFrame_,      ctx->linearSampler_);
+                ps.bindSampled(ctx->device_, 34, ctx->flowExpA_,       ctx->linearSampler_);
+                ps.bindSampled(ctx->device_, 35, ctx->flowExpB_,       ctx->linearSampler_);
+                ps.bindSampled(ctx->device_, 36, ctx->confidenceMap_,  ctx->linearSampler_);
+                ps.bindStorage(ctx->device_, 48, ctx->outputImages_[k]);
+            }
         }
 
         // ── Frame ring ────────────────────────────────────────────────────────
@@ -437,10 +519,24 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
         return ctx;
     } catch (const vk::VkError& e) {
         BFG_LOGE("FramegenContext::create VkError %d: %s", e.code, e.msg.c_str());
-        ctx->destroy(); return nullptr;
+        const bool retryModel0 = ctx->cfg_.model == 1;
+        ctx->destroy();
+        if (retryModel0) {
+            BFG_LOGW("model=1 context creation failed; retrying with model=0");
+            Config fallback = cfg; fallback.model = 0;
+            return FramegenContext::create(prevAhb, currAhb, outputAhbs, extent, format, fallback);
+        }
+        return nullptr;
     } catch (const std::exception& e) {
         BFG_LOGE("FramegenContext::create exception: %s", e.what());
-        ctx->destroy(); return nullptr;
+        const bool retryModel0 = ctx->cfg_.model == 1;
+        ctx->destroy();
+        if (retryModel0) {
+            BFG_LOGW("model=1 context creation failed; retrying with model=0");
+            Config fallback = cfg; fallback.model = 0;
+            return FramegenContext::create(prevAhb, currAhb, outputAhbs, extent, format, fallback);
+        }
+        return nullptr;
     }
 }
 
@@ -530,6 +626,15 @@ void FramegenContext::present(AHardwareBuffer* newPrev, AHardwareBuffer* newCurr
     toStorage(cmd,flowMerged_);
     passFlowMerge_.dispatch(cmd, (W+15)/16, (H+15)/16);   computeBarrier(cmd);
     toShaderRead(cmd,flowMerged_);
+
+    for (auto& img : flowPyramid_) toStorage(cmd, img);
+    passFlowPyramid_.dispatch(cmd, (W+15)/16, (H+15)/16); computeBarrier(cmd);
+    for (auto& img : flowPyramid_) toShaderRead(cmd, img);
+
+    toStorage(cmd,flowAggregated_);
+    passFlowAggregate_.dispatch(cmd, (W+15)/16, (H+15)/16); computeBarrier(cmd);
+    toShaderRead(cmd,flowAggregated_);
+
     toStorage(cmd,flowExpA_); toStorage(cmd,flowExpB_);
     passFlowExpand_.dispatch(cmd, (W+15)/16, (H+15)/16);  computeBarrier(cmd);
     toShaderRead(cmd,flowExpA_); toShaderRead(cmd,flowExpB_);
@@ -542,6 +647,11 @@ void FramegenContext::present(AHardwareBuffer* newPrev, AHardwareBuffer* newCurr
         passWarpBlend_[k].dispatch(cmd, (W+15)/16, (H+15)/16);
         computeBarrier(cmd);
         toShaderRead(cmd, confidenceMap_);
+        if (cfg_.model == 1) {
+            toShaderRead(cmd, warpedPrev_);
+            toShaderRead(cmd, warpedCurr_);
+            toStorage(cmd, model1SynthAux_);
+        }
 
         if (outputImages_[k].external())
             vk::acquireFromExternal(cmd, outputImages_[k], device_.computeFamily(), VK_ACCESS_SHADER_WRITE_BIT);
@@ -588,7 +698,8 @@ void FramegenContext::destroy() {
     destroyPass(passOFRefine0_); destroyPass(passOFRefine1_);
     destroyPass(passOFRefine2_); destroyPass(passOFRefine3_);
     destroyPass(passOFRefineLarge_);
-    destroyPass(passFlowMerge_); destroyPass(passFlowExpand_);
+    destroyPass(passFlowMerge_); destroyPass(passFlowPyramid_);
+    destroyPass(passFlowAggregate_); destroyPass(passFlowExpand_);
     for (auto& p:passWarpBlend_) p.destroy(device_); passWarpBlend_.clear();
     for (auto& p:passSynth_) p.destroy(device_); passSynth_.clear();
     uboPyramid_.destroy(device_); uboFlow_.destroy(device_);
@@ -601,9 +712,12 @@ void FramegenContext::destroy() {
     featChanA_.destroy(device_); featChanB_.destroy(device_); featChanC_.destroy(device_);
     flowFwd_.destroy(device_); flowBwd_.destroy(device_);
     flowRefinedFwd_.destroy(device_); flowRefinedBwd_.destroy(device_);
-    flowMerged_.destroy(device_); flowExpA_.destroy(device_); flowExpB_.destroy(device_);
+    flowMerged_.destroy(device_); flowAggregated_.destroy(device_);
+    for (auto& i:flowPyramid_) i.destroy(device_); flowPyramid_.clear();
+    flowExpA_.destroy(device_); flowExpB_.destroy(device_);
     confidence_.destroy(device_); warpedPrev_.destroy(device_);
     warpedCurr_.destroy(device_); confidenceMap_.destroy(device_);
+    model1SynthAux_.destroy(device_);
     if (descPool_) vkDestroyDescriptorPool(device_.handle(), descPool_, nullptr);
     descPool_ = VK_NULL_HANDLE;
     linearSampler_.destroy(device_); nearestSampler_.destroy(device_);

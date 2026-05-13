@@ -109,13 +109,16 @@ private:
 
     // Post-processing flow
     vk::Image flowMerged_;
+    std::vector<vk::Image> flowPyramid_;
+    vk::Image flowAggregated_;
     vk::Image flowExpA_, flowExpB_;
 
     // Confidence/warp intermediates (W × H, RGBA8)
     vk::Image confidence_;     // initial all-ones occlusion prior
     vk::Image warpedPrev_;     // shader_14/39 output b48
     vk::Image warpedCurr_;     // shader_14/39 output b49
-    vk::Image confidenceMap_;  // shader_14/39 output b50, consumed by shader_04 b36
+    vk::Image confidenceMap_;  // shader_14/39 output b50, consumed by synthesis b36
+    vk::Image model1SynthAux_; // shader_49 secondary output b49
 
     // ── Passes ──────────────────────────────────────────────────────────────
     // Stage 1: Pyramid
@@ -140,12 +143,14 @@ private:
     Pass passOFRefineLarge_; // shader_17 (final large refinement)
 
     // Stage 5: Flow post-processing
-    Pass passFlowMerge_;   // shader_29
-    Pass passFlowExpand_;  // shader_30
+    Pass passFlowMerge_;      // shader_29
+    Pass passFlowPyramid_;    // shader_13
+    Pass passFlowAggregate_;  // shader_25
+    Pass passFlowExpand_;     // shader_30
 
     // Stage 6: Confidence warp + synthesis (one per output frame)
     std::vector<Pass> passWarpBlend_; // shader_14/model1 shader_39 × (multiplier-1)
-    std::vector<Pass> passSynth_;     // shader_04 × (multiplier-1)
+    std::vector<Pass> passSynth_;     // shader_04/model1 shader_49 × (multiplier-1)
 
     // ── UBO buffers ──────────────────────────────────────────────────────────
     vk::Buffer uboPyramid_;
