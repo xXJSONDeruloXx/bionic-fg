@@ -1,0 +1,9 @@
+build/
+.cxx/
+.gradle/
+.DS_Store
+*.o
+*.so
+*.a
+*.dylib
+*.log
