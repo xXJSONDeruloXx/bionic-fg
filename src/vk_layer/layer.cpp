@@ -33,6 +33,12 @@
 #define BFG_LAYER_E(...)
 #endif
 
+#if defined(__GNUC__)
+#define BFG_EXPORT __attribute__((visibility("default"), used))
+#else
+#define BFG_EXPORT
+#endif
+
 namespace bfg::layer {
 
 // Minimal loader-link structs normally provided by vulkan/vk_layer.h. The
@@ -916,12 +922,12 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL BionicFG_GetInstanceProcAddr(
 
 // ─── C-linkage exports (referenced by manifest JSON) ─────────────────────────
 
-extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+extern "C" BFG_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 BionicFG_GetInstanceProcAddr(VkInstance inst, const char* name) {
     return bfg::layer::BionicFG_GetInstanceProcAddr(inst, name);
 }
 
-extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+extern "C" BFG_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 BionicFG_GetDeviceProcAddr(VkDevice dev, const char* name) {
     return bfg::layer::BionicFG_GetDeviceProcAddr(dev, name);
 }
