@@ -280,15 +280,15 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
         clearImageWhite(ctx->device_, ctx->cmdPool_, ctx->confidence_);
 
         if (useModel1) {
-            ctx->model1Scratch8_.reserve(56);
-            for (int i = 0; i < 56; ++i) ctx->model1Scratch8_.emplace_back(ctx->device_, ci);
+            ctx->model1Scratch8_.reserve(64);
+            for (int i = 0; i < 64; ++i) ctx->model1Scratch8_.emplace_back(ctx->device_, ci);
 
             vk::ImageInfo m1f;
             m1f.extent = extent;
             m1f.format = VK_FORMAT_R16G16B16A16_SFLOAT;
             m1f.usage  = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            ctx->model1Scratch16_.reserve(10);
-            for (int i = 0; i < 10; ++i) ctx->model1Scratch16_.emplace_back(ctx->device_, m1f);
+            ctx->model1Scratch16_.reserve(3);
+            for (int i = 0; i < 3; ++i) ctx->model1Scratch16_.emplace_back(ctx->device_, m1f);
         }
 
         // ── UBOs ──────────────────────────────────────────────────────────
@@ -378,7 +378,7 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
             addPass(35, 2, 2, nullptr);
             addPass(36, 2, 2, nullptr);
             addPass(37, 2, 2, nullptr);
-            addPass(38, 2, 6, &ctx->uboFlow_, true);
+            addPass(38, 2, 6, &ctx->uboFlow_, false); // R8 storage, not fp16
             addPass(39, 9, 3, &ctx->uboFlow_);
             addPass(40, 3, 4, nullptr);
             addPass(41, 4, 4, nullptr);
@@ -610,17 +610,18 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
                 ps.bindUBO    (ctx->device_, 0,  ctx->uboSynth_[k]);
                 ps.bindSampled(ctx->device_, 32, ctx->prevFrame_,      ctx->linearSampler_);
                 ps.bindSampled(ctx->device_, 33, ctx->currFrame_,      ctx->linearSampler_);
-                // Feed shader_49 from the dedicated model-1 graph scratch tail,
-                // not from the model-0 flow intermediates. This mirrors the
-                // model-1 table path (30/31 + 32..53 -> 49 synthesis).
-                ps.bindSampledGeneral(ctx->device_, 34, ctx->model1Scratch8_[40], ctx->linearSampler_);
-                ps.bindSampledGeneral(ctx->device_, 35, ctx->model1Scratch8_[41], ctx->linearSampler_);
-                ps.bindSampledGeneral(ctx->device_, 36, ctx->model1Scratch8_[42], ctx->linearSampler_);
-                ps.bindSampledGeneral(ctx->device_, 37, ctx->model1Scratch8_[43], ctx->linearSampler_);
-                ps.bindSampledGeneral(ctx->device_, 38, ctx->model1Scratch8_[44], ctx->linearSampler_);
-                ps.bindSampledGeneral(ctx->device_, 39, ctx->model1Scratch8_[45], ctx->linearSampler_);
-                ps.bindSampledGeneral(ctx->device_, 40, ctx->model1Scratch8_[46], ctx->linearSampler_);
-                ps.bindSampledGeneral(ctx->device_, 41, ctx->model1Scratch16_[8], ctx->linearSampler_);
+                // Feed shader_49 from the confirmed tail of the model-1 graph.
+                // Scratch indices derived from exact per-shader storage counts:
+                //   s8[56,57]=sh50  s8[58,59]=sh51  s8[60,61]=sh52
+                //   s16[2]=sh53     s16[1]=sh48
+                ps.bindSampledGeneral(ctx->device_, 34, ctx->model1Scratch16_[2], ctx->linearSampler_); // sh53
+                ps.bindSampledGeneral(ctx->device_, 35, ctx->model1Scratch8_[61],  ctx->linearSampler_); // sh52
+                ps.bindSampledGeneral(ctx->device_, 36, ctx->model1Scratch8_[60],  ctx->linearSampler_); // sh52
+                ps.bindSampledGeneral(ctx->device_, 37, ctx->model1Scratch8_[59],  ctx->linearSampler_); // sh51
+                ps.bindSampledGeneral(ctx->device_, 38, ctx->model1Scratch8_[58],  ctx->linearSampler_); // sh51
+                ps.bindSampledGeneral(ctx->device_, 39, ctx->model1Scratch8_[57],  ctx->linearSampler_); // sh50
+                ps.bindSampledGeneral(ctx->device_, 40, ctx->model1Scratch8_[56],  ctx->linearSampler_); // sh50
+                ps.bindSampledGeneral(ctx->device_, 41, ctx->model1Scratch16_[1],  ctx->linearSampler_); // sh48
                 ps.bindStorage(ctx->device_, 48, ctx->outputImages_[k]);
                 ps.bindStorage(ctx->device_, 49, ctx->model1SynthAux_);
             } else {
