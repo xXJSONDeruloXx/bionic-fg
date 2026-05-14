@@ -36,6 +36,8 @@ public:
     void bindUBO    (const vk::Device& dev, uint32_t binding, const vk::Buffer& buf);
     void bindSampled(const vk::Device& dev, uint32_t binding, const vk::Image&  img,
                      const vk::Sampler& sampler);
+    void bindSampledGeneral(const vk::Device& dev, uint32_t binding, const vk::Image& img,
+                            const vk::Sampler& sampler);
     void bindStorage(const vk::Device& dev, uint32_t binding, const vk::Image&  img);
 
     void dispatch(VkCommandBuffer cmd, uint32_t gx, uint32_t gy) const;
@@ -120,6 +122,12 @@ private:
     vk::Image confidenceMap_;  // shader_14/39 output b50, consumed by synthesis b36
     vk::Image model1SynthAux_; // shader_49 secondary output b49
 
+    // Model-1 real graph scratch. Native implementation initializes shader_30/31 plus
+    // shader_32..53 for model=1; keep a separate full-res scratch pool so the
+    // model-1 path does not fall back through the model-0 flow graph.
+    std::vector<vk::Image> model1Scratch8_;   // RGBA8-like model-1 intermediates
+    std::vector<vk::Image> model1Scratch16_;  // RGBA16F intermediates for 43/48/53
+
     // ── Passes ──────────────────────────────────────────────────────────────
     // Stage 1: Pyramid
     Pass passPyramidA_;    // shader_03 — curr frame → pyramidA_
@@ -149,8 +157,9 @@ private:
     Pass passFlowExpand_;     // shader_30
 
     // Stage 6: Confidence warp + synthesis (one per output frame)
-    std::vector<Pass> passWarpBlend_; // shader_14/model1 shader_39 × (multiplier-1)
+    std::vector<Pass> passWarpBlend_; // shader_14 × (multiplier-1), model0 only
     std::vector<Pass> passSynth_;     // shader_04/model1 shader_49 × (multiplier-1)
+    std::vector<Pass> model1GraphPasses_; // runtime-confirmed model1 table order, shader_30..48/50..53
 
     // ── UBO buffers ──────────────────────────────────────────────────────────
     vk::Buffer uboPyramid_;
