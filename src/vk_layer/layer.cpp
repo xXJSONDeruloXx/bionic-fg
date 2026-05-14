@@ -453,11 +453,16 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateDevice(
     VkResult res = createDevice(physicalDevice, &dci, pAllocator, pDevice);
     if (res != VK_SUCCESS) return res;
 
-    // Find compute/graphics queue family
+    // Find compute/graphics queue family through the next instance dispatch.
+    // Calling the global loader symbol from inside a layer can reject wrapped
+    // physical-device handles as invalid.
+    auto* getQueueFamilyProps = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+        nextGIPA(instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+    if (!getQueueFamilyProps) return VK_ERROR_INITIALIZATION_FAILED;
     uint32_t qfCount = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qfCount, nullptr);
+    getQueueFamilyProps(physicalDevice, &qfCount, nullptr);
     std::vector<VkQueueFamilyProperties> qfProps(qfCount);
-    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qfCount, qfProps.data());
+    getQueueFamilyProps(physicalDevice, &qfCount, qfProps.data());
     uint32_t qf = 0;
     for (uint32_t i = 0; i < qfCount; ++i) {
         if (qfProps[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) {
@@ -722,12 +727,29 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
                 throw std::runtime_error("failed to create generated-frame semaphores");
         }
 
-        // Create FramegenContext (uses its own device, imports AHBs)
+        // Create FramegenContext (uses its own device, imports AHBs). Avoid
+        // recursively loading this implicit layer into Bionic-FG's private
+        // Vulkan instance/device.
         bionic_fg::Config cfg;
         cfg.width      = W; cfg.height = H;
         cfg.multiplier = static_cast<uint32_t>(conf.multiplier);
         cfg.flowScale  = conf.flowScale;
         cfg.model      = static_cast<uint32_t>(conf.model);
+        struct DisableLayerEnvGuard {
+            bool hadDisable = false;
+            std::string oldDisable;
+            DisableLayerEnvGuard() {
+                if (const char* v = std::getenv("DISABLE_BIONIC_FG")) {
+                    hadDisable = true;
+                    oldDisable = v;
+                }
+                setenv("DISABLE_BIONIC_FG", "1", 1);
+            }
+            ~DisableLayerEnvGuard() {
+                if (hadDisable) setenv("DISABLE_BIONIC_FG", oldDisable.c_str(), 1);
+                else unsetenv("DISABLE_BIONIC_FG");
+            }
+        } disableLayerForInternalVulkan;
         st.fgCtx = bionic_fg::FramegenContext::create(
             st.prevAhb, st.currAhb, st.outAhbs, {W,H}, VK_FORMAT_R8G8B8A8_UNORM, cfg);
 
@@ -1091,7 +1113,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
 
 // ─── GetProcAddr entry points ─────────────────────────────────────────────────
 
-#define HOOK(fn) if (std::strcmp(name, #fn) == 0) return reinterpret_cast<PFN_vkVoidFunction>(BionicFG_##fn)
+#define HOOK(fn) if (std::strcmp(name, "vk" #fn) == 0 || std::strcmp(name, #fn) == 0) return reinterpret_cast<PFN_vkVoidFunction>(BionicFG_##fn)
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL BionicFG_GetDeviceProcAddr(
         VkDevice device, const char* name) {
