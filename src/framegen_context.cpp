@@ -398,6 +398,9 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
             // bind per-output below with the correct alpha UBO.
         }
 
+        // ── Model-0 stages: skip entirely for model=1 (has its own graph above) ──
+        if (!useModel1) {
+
         // ── Stage 1: Pyramid (separate Pass per frame to avoid descriptor aliasing) ──
         {
             std::vector<vk::DescriptorBinding> binds = {
@@ -641,6 +644,8 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
                 ps.bindStorage(ctx->device_, 48, ctx->outputImages_[k]);
             }
         }
+
+        } // end !useModel1 model-0 stages
 
         // ── Frame ring ────────────────────────────────────────────────────────
         for (auto& f : ctx->frames_) {
