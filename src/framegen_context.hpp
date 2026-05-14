@@ -157,8 +157,8 @@ private:
     Pass passFlowExpand_;     // shader_30
 
     // Stage 6: Confidence warp + synthesis (one per output frame)
-    std::vector<Pass> passWarpBlend_; // shader_14 × (multiplier-1), model0 only
-    std::vector<Pass> passSynth_;     // shader_04/model1 shader_49 × (multiplier-1)
+    std::vector<Pass> passWarpBlend_; // shader_14/20 × (multiplier-1), model-0 only
+    std::vector<Pass> passSynth_;     // model-0: shader_04, model-1: shader_49 × (multiplier-1)
     std::vector<Pass> model1GraphPasses_; // runtime-confirmed model1 table order, shader_30..48/50..53
 
     // ── UBO buffers ──────────────────────────────────────────────────────────
