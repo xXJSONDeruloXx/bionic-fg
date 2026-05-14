@@ -365,16 +365,15 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
                 for (vk::Image* img : storage) recent.push_back(img);
             };
 
-            // 0x1b004c cluster in the trace: first five table entries.
+            // 0x1b004c cluster: runtime-confirmed order (init table entries 0-6)
+            addPass(54, 1, 7, &ctx->uboFlow_); // slot 0x1d80: first, 1 samp, 7 R8 storage
             addPass(30, 1, 2, nullptr);
             addPass(31, 2, 2, nullptr);
             addPass(32, 2, 4, nullptr);
             addPass(33, 4, 4, nullptr);
             addPass(34, 12, 2, nullptr);
 
-            // 0x1b0708 main graph. These are the model-1 table entries in
-            // shader order, matching the traced dedicated model-1 path rather
-            // than model-0's 08/10/11/12/17 refinement chain.
+            // 0x1b0708 main graph (init table entries 6-24, runtime dispatch-confirmed)
             addPass(35, 2, 2, nullptr);
             addPass(36, 2, 2, nullptr);
             addPass(37, 2, 2, nullptr);
@@ -396,6 +395,7 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
             addPass(51, 2, 2, nullptr);
             addPass(52, 2, 2, nullptr);
             addPass(53, 3, 1, nullptr, true);
+            addPass(55, 5, 1, &ctx->uboFlow_); // slot 0x20c0: last, 5 samp, 1 storage
 
             // Stage 0x1b1b10 uses shader_49 as the model-1 synthesis pass;
             // bind per-output below with the correct alpha UBO.
@@ -615,14 +615,14 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
                 ps.bindSampled(ctx->device_, 33, ctx->currFrame_,      ctx->linearSampler_);
                 // Synthesis inputs: slot 0x2000 = shader_49 IS this synthesis pass.
                 // Reads the last 8 outputs from model1GraphPasses_:
-                //   s16[2]=sh53  s8[61,60]=sh52  s8[59,58]=sh51  s8[57,56]=sh50  s16[1]=sh48
+                //   s16[2]=sh53  s8[68,67]=sh52  s8[66,65]=sh51  s8[64,63]=sh50  s16[1]=sh48
                 ps.bindSampledGeneral(ctx->device_, 34, ctx->model1Scratch16_[2],  ctx->linearSampler_); // sh53
-                ps.bindSampledGeneral(ctx->device_, 35, ctx->model1Scratch8_[61],  ctx->linearSampler_); // sh52
-                ps.bindSampledGeneral(ctx->device_, 36, ctx->model1Scratch8_[60],  ctx->linearSampler_); // sh52
-                ps.bindSampledGeneral(ctx->device_, 37, ctx->model1Scratch8_[59],  ctx->linearSampler_); // sh51
-                ps.bindSampledGeneral(ctx->device_, 38, ctx->model1Scratch8_[58],  ctx->linearSampler_); // sh51
-                ps.bindSampledGeneral(ctx->device_, 39, ctx->model1Scratch8_[57],  ctx->linearSampler_); // sh50
-                ps.bindSampledGeneral(ctx->device_, 40, ctx->model1Scratch8_[56],  ctx->linearSampler_); // sh50
+                ps.bindSampledGeneral(ctx->device_, 35, ctx->model1Scratch8_[68],  ctx->linearSampler_); // sh52
+                ps.bindSampledGeneral(ctx->device_, 36, ctx->model1Scratch8_[67],  ctx->linearSampler_); // sh52
+                ps.bindSampledGeneral(ctx->device_, 37, ctx->model1Scratch8_[66],  ctx->linearSampler_); // sh51
+                ps.bindSampledGeneral(ctx->device_, 38, ctx->model1Scratch8_[65],  ctx->linearSampler_); // sh51
+                ps.bindSampledGeneral(ctx->device_, 39, ctx->model1Scratch8_[64],  ctx->linearSampler_); // sh50
+                ps.bindSampledGeneral(ctx->device_, 40, ctx->model1Scratch8_[63],  ctx->linearSampler_); // sh50
                 ps.bindSampledGeneral(ctx->device_, 41, ctx->model1Scratch16_[1],  ctx->linearSampler_); // sh48
                 ps.bindStorage(ctx->device_, 48, ctx->outputImages_[k]);
                 ps.bindStorage(ctx->device_, 49, ctx->model1SynthAux_);
