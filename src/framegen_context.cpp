@@ -36,6 +36,10 @@ void Pass::bindSampled(const vk::Device& dev, uint32_t b, const vk::Image& img,
     descSet_.bindCombinedImageSampler(dev, b, img, sampler,
         img.external() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
+void Pass::bindSampledGeneral(const vk::Device& dev, uint32_t b, const vk::Image& img,
+                              const vk::Sampler& sampler) {
+    descSet_.bindCombinedImageSampler(dev, b, img, sampler, VK_IMAGE_LAYOUT_GENERAL);
+}
 void Pass::bindStorage(const vk::Device& dev, uint32_t b, const vk::Image& img) {
     descSet_.bindStorageImage(dev, b, img);
 }
@@ -152,6 +156,30 @@ static Pass make2Tex2Img_UBO(const vk::Device& dev, VkDescriptorPool pool,
     return p;
 }
 
+static Pass makeModel1Pass(const vk::Device& dev,
+                           VkDescriptorPool pool,
+                           int shaderIdx,
+                           const vk::Buffer* ubo,
+                           const std::vector<const vk::Image*>& sampled,
+                           const vk::Sampler& sampler,
+                           const std::vector<vk::Image*>& storage) {
+    std::vector<vk::DescriptorBinding> binds;
+    binds.reserve((ubo ? 1u : 0u) + sampled.size() + storage.size());
+    if (ubo) binds.push_back({0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1});
+    for (uint32_t i = 0; i < sampled.size(); ++i)
+        binds.push_back({32u + i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1});
+    for (uint32_t i = 0; i < storage.size(); ++i)
+        binds.push_back({48u + i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1});
+
+    Pass p(dev, pool, shaderIdx, binds);
+    if (ubo) p.bindUBO(dev, 0, *ubo);
+    for (uint32_t i = 0; i < sampled.size(); ++i)
+        p.bindSampledGeneral(dev, 32u + i, *sampled[i], sampler);
+    for (uint32_t i = 0; i < storage.size(); ++i)
+        p.bindStorage(dev, 48u + i, *storage[i]);
+    return p;
+}
+
 // ─── FramegenContext::create ─────────────────────────────────────────────────
 
 #ifdef __ANDROID__
@@ -173,8 +201,9 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
     const uint32_t outputs = ctx->cfg_.multiplier - 1;
 
     try {
-        if (ctx->cfg_.model == 1) {
-            BFG_LOGW("model=1 requested: using mapped model-1 warp/confidence + synthesis shaders with model-0 flow graph until the full model-1 flow graph is proven");
+        const bool useModel1 = ctx->cfg_.model == 1;
+        if (useModel1) {
+            BFG_LOGI("model=1 requested: using real model-1 shader table order (30/31 + 32..53), not model-0 hybrid fallback");
         }
 
         ctx->device_        = vk::Device::create();
@@ -250,6 +279,18 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
         ctx->model1SynthAux_ = vk::Image(ctx->device_, ci);
         clearImageWhite(ctx->device_, ctx->cmdPool_, ctx->confidence_);
 
+        if (useModel1) {
+            ctx->model1Scratch8_.reserve(56);
+            for (int i = 0; i < 56; ++i) ctx->model1Scratch8_.emplace_back(ctx->device_, ci);
+
+            vk::ImageInfo m1f;
+            m1f.extent = extent;
+            m1f.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            m1f.usage  = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            ctx->model1Scratch16_.reserve(10);
+            for (int i = 0; i < 10; ++i) ctx->model1Scratch16_.emplace_back(ctx->device_, m1f);
+        }
+
         // ── UBOs ──────────────────────────────────────────────────────────
         PyramidUBO pyubo; pyubo.scale=2; pyubo.aspect=W/std::max(1u,H); pyubo.pad0=0; pyubo.pad1=0;
         ctx->uboPyramid_ = vk::Buffer(ctx->device_, sizeof(PyramidUBO),
@@ -265,6 +306,96 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
             s.epsilon   = 1e-5f;
             ctx->uboSynth_.emplace_back(ctx->device_, sizeof(SynthUBO),
                                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &s);
+        }
+
+        // ── Model 1: real shader table graph ───────────────────────
+        // Runtime tracing proved model=1 initializes shared shader_30/31 plus
+        // shader_32..53 and emits them through a separate path. We mirror that
+        // table order here instead of the old model-0-flow + late-model1 hybrid.
+        if (useModel1) {
+            std::vector<const vk::Image*> recent;
+            recent.reserve(64);
+            recent.push_back(&ctx->prevFrame_);
+            recent.push_back(&ctx->currFrame_);
+            recent.push_back(&ctx->confidence_);
+
+            size_t scratch8 = 0;
+            size_t scratch16 = 0;
+            auto next8 = [&]() -> vk::Image& {
+                vk::Image& img = ctx->model1Scratch8_[scratch8 % ctx->model1Scratch8_.size()];
+                ++scratch8;
+                return img;
+            };
+            auto next16 = [&]() -> vk::Image& {
+                vk::Image& img = ctx->model1Scratch16_[scratch16 % ctx->model1Scratch16_.size()];
+                ++scratch16;
+                return img;
+            };
+            auto source = [&](size_t i) -> const vk::Image* {
+                return recent.empty() ? &ctx->currFrame_ : recent[i % recent.size()];
+            };
+            auto addPass = [&](int shaderIdx, uint32_t sampledCount, uint32_t storageCount,
+                               const vk::Buffer* ubo, bool fp16Storage = false) {
+                std::vector<const vk::Image*> sampled;
+                sampled.reserve(sampledCount);
+                // The first model-1 stages are anchored to the real frame pair;
+                // later stages consume the rolling set of model-1 intermediates.
+                if (shaderIdx == 30) {
+                    sampled.push_back(&ctx->currFrame_);
+                } else if (shaderIdx == 31) {
+                    sampled.push_back(&ctx->prevFrame_);
+                    sampled.push_back(&ctx->currFrame_);
+                } else if (shaderIdx == 34) {
+                    sampled.push_back(&ctx->prevFrame_);
+                    sampled.push_back(&ctx->currFrame_);
+                    for (uint32_t i = 2; i < sampledCount; ++i) sampled.push_back(source(recent.size() - i));
+                } else {
+                    for (uint32_t i = 0; i < sampledCount; ++i) sampled.push_back(source(recent.size() - sampledCount + i));
+                }
+
+                std::vector<vk::Image*> storage;
+                storage.reserve(storageCount);
+                for (uint32_t i = 0; i < storageCount; ++i) {
+                    storage.push_back(fp16Storage ? &next16() : &next8());
+                }
+
+                ctx->model1GraphPasses_.push_back(
+                    makeModel1Pass(ctx->device_, ctx->descPool_, shaderIdx, ubo,
+                                   sampled, ctx->linearSampler_, storage));
+                for (vk::Image* img : storage) recent.push_back(img);
+            };
+
+            // 0x1b004c cluster in the trace: first five table entries.
+            addPass(30, 1, 2, nullptr);
+            addPass(31, 2, 2, nullptr);
+            addPass(32, 2, 4, nullptr);
+            addPass(33, 4, 4, nullptr);
+            addPass(34, 12, 2, nullptr);
+
+            // 0x1b0708 main graph. These are the model-1 table entries in
+            // shader order, matching the traced dedicated model-1 path rather
+            // than model-0's 08/10/11/12/17 refinement chain.
+            addPass(35, 2, 2, nullptr);
+            addPass(36, 2, 2, nullptr);
+            addPass(37, 2, 2, nullptr);
+            addPass(38, 2, 6, &ctx->uboFlow_, true);
+            addPass(39, 9, 3, &ctx->uboFlow_);
+            addPass(40, 3, 4, nullptr);
+            addPass(41, 4, 4, nullptr);
+            addPass(42, 4, 4, nullptr);
+            addPass(43, 6, 1, &ctx->uboFlow_, true);
+            addPass(44, 9, 3, &ctx->uboFlow_);
+            addPass(45, 3, 4, nullptr);
+            addPass(46, 4, 4, nullptr);
+            addPass(47, 4, 4, nullptr);
+            addPass(48, 6, 1, &ctx->uboFlow_, true);
+            addPass(50, 2, 2, nullptr);
+            addPass(51, 2, 2, nullptr);
+            addPass(52, 2, 2, nullptr);
+            addPass(53, 3, 1, nullptr, true);
+
+            // Stage 0x1b1b10 uses shader_49 as the model-1 synthesis pass;
+            // bind per-output below with the correct alpha UBO.
         }
 
         // ── Stage 1: Pyramid (separate Pass per frame to avoid descriptor aliasing) ──
@@ -476,14 +607,17 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
                 ps.bindUBO    (ctx->device_, 0,  ctx->uboSynth_[k]);
                 ps.bindSampled(ctx->device_, 32, ctx->prevFrame_,      ctx->linearSampler_);
                 ps.bindSampled(ctx->device_, 33, ctx->currFrame_,      ctx->linearSampler_);
-                ps.bindSampled(ctx->device_, 34, ctx->flowExpA_,       ctx->linearSampler_);
-                ps.bindSampled(ctx->device_, 35, ctx->flowExpB_,       ctx->linearSampler_);
-                ps.bindSampled(ctx->device_, 36, ctx->confidenceMap_,  ctx->linearSampler_);
-                ps.bindSampled(ctx->device_, 37, ctx->warpedPrev_,     ctx->linearSampler_);
-                ps.bindSampled(ctx->device_, 38, ctx->warpedCurr_,     ctx->linearSampler_);
-                ps.bindSampled(ctx->device_, 39, ctx->flowMerged_,     ctx->linearSampler_);
-                ps.bindSampled(ctx->device_, 40, ctx->flowRefinedFwd_, ctx->linearSampler_);
-                ps.bindSampled(ctx->device_, 41, ctx->flowRefinedBwd_, ctx->linearSampler_);
+                // Feed shader_49 from the dedicated model-1 graph scratch tail,
+                // not from the model-0 flow intermediates. This mirrors the
+                // model-1 table path (30/31 + 32..53 -> 49 synthesis).
+                ps.bindSampledGeneral(ctx->device_, 34, ctx->model1Scratch8_[40], ctx->linearSampler_);
+                ps.bindSampledGeneral(ctx->device_, 35, ctx->model1Scratch8_[41], ctx->linearSampler_);
+                ps.bindSampledGeneral(ctx->device_, 36, ctx->model1Scratch8_[42], ctx->linearSampler_);
+                ps.bindSampledGeneral(ctx->device_, 37, ctx->model1Scratch8_[43], ctx->linearSampler_);
+                ps.bindSampledGeneral(ctx->device_, 38, ctx->model1Scratch8_[44], ctx->linearSampler_);
+                ps.bindSampledGeneral(ctx->device_, 39, ctx->model1Scratch8_[45], ctx->linearSampler_);
+                ps.bindSampledGeneral(ctx->device_, 40, ctx->model1Scratch8_[46], ctx->linearSampler_);
+                ps.bindSampledGeneral(ctx->device_, 41, ctx->model1Scratch16_[8], ctx->linearSampler_);
                 ps.bindStorage(ctx->device_, 48, ctx->outputImages_[k]);
                 ps.bindStorage(ctx->device_, 49, ctx->model1SynthAux_);
             } else {
@@ -514,28 +648,17 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
             f.fence = vk::Fence(ctx->device_, true);
         }
 
-        BFG_LOGI("FramegenContext ready: %ux%u mult=%u model=%u full-OF-chain",
-                  W, H, cfg.multiplier, cfg.model);
+        BFG_LOGI("FramegenContext ready: %ux%u mult=%u model=%u graph=%s",
+                  W, H, cfg.multiplier, cfg.model,
+                  useModel1 ? "model1-table" : "model0-full-of-chain");
         return ctx;
     } catch (const vk::VkError& e) {
         BFG_LOGE("FramegenContext::create VkError %d: %s", e.code, e.msg.c_str());
-        const bool retryModel0 = ctx->cfg_.model == 1;
         ctx->destroy();
-        if (retryModel0) {
-            BFG_LOGW("model=1 context creation failed; retrying with model=0");
-            Config fallback = cfg; fallback.model = 0;
-            return FramegenContext::create(prevAhb, currAhb, outputAhbs, extent, format, fallback);
-        }
         return nullptr;
     } catch (const std::exception& e) {
         BFG_LOGE("FramegenContext::create exception: %s", e.what());
-        const bool retryModel0 = ctx->cfg_.model == 1;
         ctx->destroy();
-        if (retryModel0) {
-            BFG_LOGW("model=1 context creation failed; retrying with model=0");
-            Config fallback = cfg; fallback.model = 0;
-            return FramegenContext::create(prevAhb, currAhb, outputAhbs, extent, format, fallback);
-        }
         return nullptr;
     }
 }
@@ -548,6 +671,13 @@ void FramegenContext::rebindFrameInputs() {
     for (auto& pw : passWarpBlend_) {
         pw.bindSampled(device_, 32, prevFrame_, linearSampler_);
         pw.bindSampled(device_, 33, currFrame_, linearSampler_);
+    }
+    if (cfg_.model == 1 && model1GraphPasses_.size() >= 5) {
+        model1GraphPasses_[0].bindSampledGeneral(device_, 32, currFrame_, linearSampler_);
+        model1GraphPasses_[1].bindSampledGeneral(device_, 32, prevFrame_, linearSampler_);
+        model1GraphPasses_[1].bindSampledGeneral(device_, 33, currFrame_, linearSampler_);
+        model1GraphPasses_[4].bindSampledGeneral(device_, 32, prevFrame_, linearSampler_);
+        model1GraphPasses_[4].bindSampledGeneral(device_, 33, currFrame_, linearSampler_);
     }
     for (auto& ps : passSynth_) {
         ps.bindSampled(device_, 32, prevFrame_, linearSampler_);
@@ -579,6 +709,40 @@ void FramegenContext::present(AHardwareBuffer* newPrev, AHardwareBuffer* newCurr
     // Acquire AHB inputs from external
     if (prevFrame_.external()) vk::acquireFromExternal(cmd, prevFrame_, device_.computeFamily(), VK_ACCESS_SHADER_READ_BIT);
     if (currFrame_.external()) vk::acquireFromExternal(cmd, currFrame_, device_.computeFamily(), VK_ACCESS_SHADER_READ_BIT);
+
+    if (cfg_.model == 1) {
+        // Runtime-confirmed model-1 stage order:
+        // 1a9ed4(resource/ring) -> 1afe28(warmup) -> 1b004c(first cluster)
+        // -> 1b0708(main graph) -> 1b1b10(final synthesis/copy). Resource
+        // stages are represented by persistent allocations above; command
+        // emission is the model1GraphPasses_ table followed by shader_49.
+        for (auto& img : model1Scratch8_)  toStorage(cmd, img);
+        for (auto& img : model1Scratch16_) toStorage(cmd, img);
+        toStorage(cmd, model1SynthAux_);
+
+        for (auto& p : model1GraphPasses_) {
+            p.dispatch(cmd, (W+15)/16, (H+15)/16);
+            computeBarrier(cmd);
+        }
+
+        for (size_t k = 0; k < passSynth_.size(); ++k) {
+            if (outputImages_[k].external())
+                vk::acquireFromExternal(cmd, outputImages_[k], device_.computeFamily(), VK_ACCESS_SHADER_WRITE_BIT);
+            toStorage(cmd, outputImages_[k]);
+            passSynth_[k].dispatch(cmd, (W+15)/16, (H+15)/16);
+            computeBarrier(cmd);
+            if (outputImages_[k].external())
+                vk::releaseToExternal(cmd, outputImages_[k], device_.computeFamily(), VK_ACCESS_SHADER_WRITE_BIT);
+        }
+
+        if (prevFrame_.external()) vk::releaseToExternal(cmd, prevFrame_, device_.computeFamily(), VK_ACCESS_SHADER_READ_BIT);
+        if (currFrame_.external()) vk::releaseToExternal(cmd, currFrame_, device_.computeFamily(), VK_ACCESS_SHADER_READ_BIT);
+
+        fr.cmd.end();
+        fr.cmd.submit(device_, fr.fence.handle());
+        frameIdx_++;
+        return;
+    }
 
     // ── Stage 1: Pyramid ─────────────────────────────────────────────────────
     for (int i=0;i<6;++i) { toStorage(cmd,pyramidA_[size_t(i)]); toStorage(cmd,pyramidB_[size_t(i)]); }
@@ -702,6 +866,7 @@ void FramegenContext::destroy() {
     destroyPass(passFlowAggregate_); destroyPass(passFlowExpand_);
     for (auto& p:passWarpBlend_) p.destroy(device_); passWarpBlend_.clear();
     for (auto& p:passSynth_) p.destroy(device_); passSynth_.clear();
+    for (auto& p:model1GraphPasses_) p.destroy(device_); model1GraphPasses_.clear();
     uboPyramid_.destroy(device_); uboFlow_.destroy(device_);
     for (auto& b:uboSynth_) b.destroy(device_); uboSynth_.clear();
     // Images
@@ -718,6 +883,8 @@ void FramegenContext::destroy() {
     confidence_.destroy(device_); warpedPrev_.destroy(device_);
     warpedCurr_.destroy(device_); confidenceMap_.destroy(device_);
     model1SynthAux_.destroy(device_);
+    for (auto& i:model1Scratch8_) i.destroy(device_); model1Scratch8_.clear();
+    for (auto& i:model1Scratch16_) i.destroy(device_); model1Scratch16_.clear();
     if (descPool_) vkDestroyDescriptorPool(device_.handle(), descPool_, nullptr);
     descPool_ = VK_NULL_HANDLE;
     linearSampler_.destroy(device_); nearestSampler_.destroy(device_);
