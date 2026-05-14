@@ -1,7 +1,7 @@
 // Bionic FG Vulkan implicit layer
 // Intercepts vkCreateSwapchainKHR + vkQueuePresentKHR to inject generated frames.
 // Image sharing between producer device and framegen device is done via AHardwareBuffer.
-// Enabled only when BIONIC_FG_ENABLE=1 is set in the environment.
+// Enabled by BIONIC_FG_ENABLE=1 and configured by conf.toml.
 
 #include "../framegen_context.hpp"
 #include "../logging.hpp"
@@ -15,13 +15,18 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
 #include <unordered_map>
 #include <vector>
 
@@ -72,24 +77,145 @@ static void* dispatchKey(void* h) { return *reinterpret_cast<void**>(h); }
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 struct LayerConf {
-    bool    enabled    = false;
-    int     multiplier = 2;
-    float   flowScale  = 0.6f;
-    int     model      = 0;
+    bool        enabled    = false;
+    int         multiplier = 2;
+    float       flowScale  = 0.6f;
+    int         model      = 0;
+    std::string configPath;
+    int64_t     configStamp = 0;
 };
+
+static std::string trim(std::string s) {
+    auto notSpace = [](unsigned char ch) { return !std::isspace(ch); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
+    s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
+    return s;
+}
+
+static std::string stripComment(const std::string& line) {
+    bool inString = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        char ch = line[i];
+        if (ch == '"' && (i == 0 || line[i - 1] != '\\')) inString = !inString;
+        if (ch == '#' && !inString) return line.substr(0, i);
+    }
+    return line;
+}
+
+static std::string unquote(std::string value) {
+    value = trim(value);
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+        value = value.substr(1, value.size() - 2);
+        std::string out;
+        out.reserve(value.size());
+        bool escaped = false;
+        for (char ch : value) {
+            if (escaped) {
+                out.push_back(ch);
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else {
+                out.push_back(ch);
+            }
+        }
+        return out;
+    }
+    return value;
+}
+
+static bool parseBool(std::string value, bool fallback) {
+    value = unquote(value);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (value == "true" || value == "1" || value == "yes" || value == "on") return true;
+    if (value == "false" || value == "0" || value == "no" || value == "off") return false;
+    return fallback;
+}
+
+static int64_t fileStamp(const std::string& path) {
+    struct stat st{};
+    if (path.empty() || stat(path.c_str(), &st) != 0) return 0;
+#if defined(__APPLE__)
+    return static_cast<int64_t>(st.st_mtimespec.tv_sec) * 1000000000LL + st.st_mtimespec.tv_nsec;
+#else
+    return static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000LL + st.st_mtim.tv_nsec;
+#endif
+}
+
+static std::string defaultConfigPath() {
+    if (const char* explicitPath = std::getenv("BIONIC_FG_CONFIG")) {
+        if (explicitPath[0] != '\0') return explicitPath;
+    }
+    if (const char* home = std::getenv("HOME")) {
+        if (home[0] != '\0') return std::string(home) + "/.config/bionic-fg/conf.toml";
+    }
+    return {};
+}
+
+static void parseConfigFile(const std::string& path, LayerConf& c) {
+    std::ifstream in(path);
+    if (!in) return;
+
+    bool sawEnabled = false;
+    std::string line;
+    while (std::getline(in, line)) {
+        line = trim(stripComment(line));
+        if (line.empty() || line.front() == '[') continue;
+
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = trim(line.substr(0, eq));
+        std::string value = trim(line.substr(eq + 1));
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+
+        try {
+            if (key == "enabled") {
+                c.enabled = parseBool(value, c.enabled);
+                sawEnabled = true;
+            } else if (key == "multiplier") {
+                c.multiplier = std::max(2, std::min(4, std::atoi(unquote(value).c_str())));
+            } else if (key == "flow_scale" || key == "flowscale") {
+                c.flowScale = std::max(0.2f, std::min(1.0f, static_cast<float>(std::atof(unquote(value).c_str()))));
+            } else if (key == "model") {
+                c.model = std::max(0, std::min(1, std::atoi(unquote(value).c_str())));
+            }
+        } catch (...) {
+            BFG_LAYER_E("Ignoring invalid config value: %s", line.c_str());
+        }
+    }
+
+    // If a config exists but omits enabled, keep the launch activation state.
+    (void)sawEnabled;
+}
 
 static LayerConf readConf() {
     LayerConf c;
+
     const char* en = std::getenv("BIONIC_FG_ENABLE");
-    if (!en || en[0] != '1') return c;
-    c.enabled = true;
+    c.enabled = en && en[0] == '1';
+
+    // Backwards-compatible env fallback. A config file, when present, wins.
     if (auto* v = std::getenv("BIONIC_FG_MULTIPLIER"))
         c.multiplier = std::max(2, std::min(4, std::atoi(v)));
     if (auto* v = std::getenv("BIONIC_FG_FLOW_SCALE"))
-        c.flowScale = std::max(0.2f, std::min(1.0f, (float)std::atof(v)));
+        c.flowScale = std::max(0.2f, std::min(1.0f, static_cast<float>(std::atof(v))));
     if (auto* v = std::getenv("BIONIC_FG_MODEL"))
         c.model = std::max(0, std::min(1, std::atoi(v)));
+
+    c.configPath = defaultConfigPath();
+    if (!c.configPath.empty()) {
+        c.configStamp = fileStamp(c.configPath);
+        if (c.configStamp != 0) parseConfigFile(c.configPath, c);
+    }
     return c;
+}
+
+static bool configNeedsSwapchainRecreate(const LayerConf& oldConf, const LayerConf& newConf) {
+    return oldConf.enabled != newConf.enabled ||
+           oldConf.multiplier != newConf.multiplier ||
+           oldConf.model != newConf.model;
 }
 
 // ─── Instance data ────────────────────────────────────────────────────────────
@@ -880,6 +1006,25 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
         stPtr = &it->second;
     }
     SwapState& st = *stPtr;
+
+    if (!st.conf.configPath.empty()) {
+        int64_t currentStamp = fileStamp(st.conf.configPath);
+        if (currentStamp != 0 && currentStamp != st.conf.configStamp) {
+            LayerConf newConf = readConf();
+            bool recreate = configNeedsSwapchainRecreate(st.conf, newConf);
+            st.conf = newConf;
+            if (recreate) {
+                BFG_LAYER("config changed; requesting swapchain recreate enabled=%d mult=%d flow=%.2f model=%d",
+                          st.conf.enabled ? 1 : 0, st.conf.multiplier, st.conf.flowScale, st.conf.model);
+                return VK_ERROR_OUT_OF_DATE_KHR;
+            }
+            if (st.fgCtx) {
+                st.fgCtx->updateConfig(bionic_fg::Config{st.extent.width, st.extent.height,
+                    uint32_t(st.conf.multiplier), st.conf.flowScale, uint32_t(st.conf.model)});
+                BFG_LAYER("config hot-reloaded flow=%.2f", st.conf.flowScale);
+            }
+        }
+    }
 
     if (st.inPresent || !st.conf.enabled || !st.fgCtx)
         return callNextPresent(queue, pPresentInfo);

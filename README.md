@@ -10,17 +10,35 @@ Standalone Android/Bionic Vulkan frame generation layer.
 - Embedded SPIR-V shader bundle with model 0 and model 1 selection
 - Optional JNI bootstrap API under `io.github.bionicfg.BionicFGNative`
 
-## Runtime environment
+## Runtime configuration
 
-The Vulkan layer is enabled by environment variables:
+The Vulkan layer is enabled with `BIONIC_FG_ENABLE=1` and reads a TOML config file.
+The config path defaults to `$HOME/.config/bionic-fg/conf.toml` and can be overridden with `BIONIC_FG_CONFIG`.
 
 ```sh
 BIONIC_FG_ENABLE=1
-BIONIC_FG_MULTIPLIER=2   # 2..4
-BIONIC_FG_FLOW_SCALE=0.6 # 0.2..1.0
-BIONIC_FG_MODEL=0        # 0 or 1
+BIONIC_FG_CONFIG=/path/to/conf.toml # optional
 VK_LAYER_PATH=/path/to/implicit_layer.d
 ```
+
+```toml
+version = 1
+
+[global]
+enabled = true
+multiplier = 2   # 2..4
+flow_scale = 0.8 # 0.2..1.0
+model = 0        # 0 or 1
+```
+
+For backwards compatibility, `BIONIC_FG_MULTIPLIER`, `BIONIC_FG_FLOW_SCALE`, and
+`BIONIC_FG_MODEL` are still accepted when the TOML file is missing. If the TOML
+file exists, it wins.
+
+The layer polls the config file timestamp during presentation. Flow-scale changes
+hot-reload in place. Changes to `enabled`, `multiplier`, or `model` return
+`VK_ERROR_OUT_OF_DATE_KHR` once so the application recreates its swapchain with
+the new frame-generation setup.
 
 Install layout expected by the manifest:
 
