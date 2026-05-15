@@ -117,16 +117,12 @@ private:
 
     // Confidence/warp intermediates (W × H, RGBA8)
     vk::Image confidence_;     // initial all-ones occlusion prior
-    vk::Image warpedPrev_;     // shader_14/39 output b48
-    vk::Image warpedCurr_;     // shader_14/39 output b49
-    vk::Image confidenceMap_;  // shader_14/39 output b50, consumed by synthesis b36
-    vk::Image model1SynthAux_; // shader_49 secondary output b49
+    vk::Image warpedPrev_;     // shader_14 output b48, model0
+    vk::Image warpedCurr_;     // shader_14 output b49, model0
+    vk::Image confidenceMap_;  // shader_14 output b50, consumed by model0 synthesis b36
 
-    // Model-1 real graph scratch. Native implementation initializes shader_30/31 plus
-    // shader_32..53 for model=1; keep a separate full-res scratch pool so the
-    // model-1 path does not fall back through the model-0 flow graph.
-    std::vector<vk::Image> model1Scratch8_;   // RGBA8-like model-1 intermediates
-    std::vector<vk::Image> model1Scratch16_;  // RGBA16F intermediates for 43/48/53
+    // Runtime-confirmed Model-1 resources (descriptor labels dNNN.bXX from RE CSV).
+    std::vector<vk::Image> model1Resources_;
 
     // ── Passes ──────────────────────────────────────────────────────────────
     // Stage 1: Pyramid
@@ -158,8 +154,10 @@ private:
 
     // Stage 6: Confidence warp + synthesis (one per output frame)
     std::vector<Pass> passWarpBlend_; // shader_14 × (multiplier-1), model0 only
-    std::vector<Pass> passSynth_;     // shader_04/model1 shader_49 × (multiplier-1)
-    std::vector<Pass> model1GraphPasses_; // runtime-confirmed model1 table order, shader_30..48/50..53
+    std::vector<Pass> passSynth_;     // shader_04 × (multiplier-1), model0 only
+    std::vector<Pass> model1GraphPasses_;       // runtime-confirmed model1 dispatch graph
+    std::vector<VkExtent2D> model1GraphDispatch_; // per-pass group counts
+    size_t model1FinalPassStart_ = 0;
 
     // ── UBO buffers ──────────────────────────────────────────────────────────
     vk::Buffer uboPyramid_;
