@@ -5,6 +5,10 @@
 #include <sstream>
 #include <stdexcept>
 #include <algorithm>
+#include <array>
+#include <cstdio>
+#include <string>
+#include <unordered_map>
 
 namespace bionic_fg {
 
@@ -203,7 +207,7 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
     try {
         const bool useModel1 = ctx->cfg_.model == 1;
         if (useModel1) {
-            BFG_LOGI("model=1 requested: using real model-1 shader table order (30/31 + 32..53), not model-0 hybrid fallback");
+            BFG_LOGI("model=1 requested: using traced 100-dispatch graph (shader_03, 30..53, final 04), not model-0 hybrid fallback");
         }
 
         ctx->device_        = vk::Device::create();
@@ -276,20 +280,7 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
         ctx->warpedPrev_     = vk::Image(ctx->device_, ci);
         ctx->warpedCurr_     = vk::Image(ctx->device_, ci);
         ctx->confidenceMap_  = vk::Image(ctx->device_, ci);
-        ctx->model1SynthAux_ = vk::Image(ctx->device_, ci);
         clearImageWhite(ctx->device_, ctx->cmdPool_, ctx->confidence_);
-
-        if (useModel1) {
-            ctx->model1Scratch8_.reserve(64);
-            for (int i = 0; i < 64; ++i) ctx->model1Scratch8_.emplace_back(ctx->device_, ci);
-
-            vk::ImageInfo m1f;
-            m1f.extent = extent;
-            m1f.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-            m1f.usage  = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            ctx->model1Scratch16_.reserve(3);
-            for (int i = 0; i < 3; ++i) ctx->model1Scratch16_.emplace_back(ctx->device_, m1f);
-        }
 
         // ── UBOs ──────────────────────────────────────────────────────────
         PyramidUBO pyubo; pyubo.scale=2; pyubo.aspect=W/std::max(1u,H); pyubo.pad0=0; pyubo.pad1=0;
@@ -308,97 +299,271 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
                                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &s);
         }
 
-        // ── Model 1: real shader table graph ───────────────────────
-        // Runtime tracing proved model=1 initializes shared shader_30/31 plus
-        // shader_32..53 and emits them through a separate path. We mirror that
-        // table order here instead of the old model-0-flow + late-model1 hybrid.
+        // ── Model 1: runtime-confirmed graph ───────────────────────
+        // The reference implementation owns more persistent/history resources
+        // than an implicit layer can see directly. The compute side still needs
+        // to match the observed model-1 dispatch/resource graph: 99 internal
+        // dispatches (shader_03, shader_30..53) plus final shader_04 per
+        // generated output. Descriptor labels below follow the traced
+        // descriptor-edge map used for this graph reconstruction.
         if (useModel1) {
-            std::vector<const vk::Image*> recent;
-            recent.reserve(64);
-            recent.push_back(&ctx->prevFrame_);
-            recent.push_back(&ctx->currFrame_);
-            recent.push_back(&ctx->confidence_);
+            struct Ratio { uint32_t num; uint32_t den; };
+            auto ratio = [](uint32_t num, uint32_t den) { return Ratio{num, den}; };
+            auto extentFor = [&](Ratio r) -> VkExtent2D {
+                const uint32_t ew = std::max(1u, static_cast<uint32_t>((uint64_t(W) * r.num + r.den - 1u) / r.den));
+                const uint32_t eh = std::max(1u, static_cast<uint32_t>((uint64_t(H) * r.num + r.den - 1u) / r.den));
+                return {ew, eh};
+            };
+            auto groupsFor = [&](Ratio r) -> VkExtent2D {
+                VkExtent2D e = extentFor(r);
+                return {std::max(1u, (e.width + 15u) / 16u),
+                        std::max(1u, (e.height + 15u) / 16u)};
+            };
+            auto dLabel = [](int dispatch, int binding) -> std::string {
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), "d%03d.b%d", dispatch, binding);
+                return std::string(buf);
+            };
+            auto extLabel = [](int ext) -> std::string {
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), "ext%d", ext);
+                return std::string(buf);
+            };
+            auto dLabels = [&](int dispatch, int firstBinding, int count) {
+                std::vector<std::string> out;
+                out.reserve(static_cast<size_t>(count));
+                for (int i = 0; i < count; ++i) out.push_back(dLabel(dispatch, firstBinding + i));
+                return out;
+            };
+            auto extLabels = [&](int firstExt, int count) {
+                std::vector<std::string> out;
+                out.reserve(static_cast<size_t>(count));
+                for (int i = 0; i < count; ++i) out.push_back(extLabel(firstExt + i));
+                return out;
+            };
+            auto append = [](std::vector<std::string>& dst, std::vector<std::string> src) {
+                dst.insert(dst.end(), src.begin(), src.end());
+            };
 
-            size_t scratch8 = 0;
-            size_t scratch16 = 0;
-            auto next8 = [&]() -> vk::Image& {
-                vk::Image& img = ctx->model1Scratch8_[scratch8 % ctx->model1Scratch8_.size()];
-                ++scratch8;
-                return img;
-            };
-            auto next16 = [&]() -> vk::Image& {
-                vk::Image& img = ctx->model1Scratch16_[scratch16 % ctx->model1Scratch16_.size()];
-                ++scratch16;
-                return img;
-            };
-            auto source = [&](size_t i) -> const vk::Image* {
-                return recent.empty() ? &ctx->currFrame_ : recent[i % recent.size()];
-            };
-            auto addPass = [&](int shaderIdx, uint32_t sampledCount, uint32_t storageCount,
-                               const vk::Buffer* ubo, bool fp16Storage = false) {
-                std::vector<const vk::Image*> sampled;
-                sampled.reserve(sampledCount);
-                // The first model-1 stages are anchored to the real frame pair;
-                // later stages consume the rolling set of model-1 intermediates.
-                if (shaderIdx == 30) {
-                    sampled.push_back(&ctx->currFrame_);
-                } else if (shaderIdx == 31) {
-                    sampled.push_back(&ctx->prevFrame_);
-                    sampled.push_back(&ctx->currFrame_);
-                } else if (shaderIdx == 34) {
-                    sampled.push_back(&ctx->prevFrame_);
-                    sampled.push_back(&ctx->currFrame_);
-                    for (uint32_t i = 2; i < sampledCount; ++i) sampled.push_back(source(recent.size() - i));
-                } else {
-                    for (uint32_t i = 0; i < sampledCount; ++i) sampled.push_back(source(recent.size() - sampledCount + i));
+            auto storageFormatForShader = [](int shaderIdx) -> VkFormat {
+                switch (shaderIdx) {
+                    case 3:
+                    case 38:
+                        return VK_FORMAT_R8_UNORM;
+                    case 43:
+                    case 48:
+                    case 53:
+                        return VK_FORMAT_R16G16B16A16_SFLOAT;
+                    default:
+                        return VK_FORMAT_R8G8B8A8_UNORM;
                 }
+            };
+            auto uboForShader = [&](int shaderIdx) -> const vk::Buffer* {
+                switch (shaderIdx) {
+                    case 3:
+                        return &ctx->uboPyramid_;
+                    case 38:
+                    case 39:
+                    case 43:
+                    case 44:
+                    case 48:
+                    case 49:
+                        return &ctx->uboFlow_;
+                    default:
+                        return nullptr;
+                }
+            };
 
+            ctx->model1Resources_.reserve(320);
+            std::unordered_map<std::string, size_t> resourceIndex;
+            auto allocateResource = [&](const std::string& label, VkFormat fmt, VkExtent2D e) -> vk::Image& {
+                auto found = resourceIndex.find(label);
+                if (found != resourceIndex.end()) return ctx->model1Resources_[found->second];
+                vk::ImageInfo info;
+                info.extent = e;
+                info.format = fmt;
+                info.usage  = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                const size_t idx = ctx->model1Resources_.size();
+                ctx->model1Resources_.emplace_back(ctx->device_, info);
+                resourceIndex.emplace(label, idx);
+                return ctx->model1Resources_.back();
+            };
+            auto resourceForD = [&](const std::string& label) -> vk::Image& {
+                return ctx->model1Resources_[resourceIndex.at(label)];
+            };
+
+            // Most extN labels are persistent/history resources from the traced
+            // native graph. In the implicit-layer adaptation we feed matching
+            // current-frame graph products instead; ext1/ext35 remain the real
+            // curr/prev frame pair used by shader_03 and final shader_04.
+            auto mappedExternalLabel = [&](int ext) -> std::string {
+                if (ext >= 2 && ext <= 5)   return dLabel(23, 48 + (ext - 2));
+                if (ext >= 6 && ext <= 9)   return dLabel(23, 48 + (ext - 6));
+                if (ext >= 10 && ext <= 13) return dLabel(29, 48 + (ext - 10));
+                if (ext == 14)              return dLabel(34, 53);
+                if (ext >= 15 && ext <= 18) return dLabel(28, 48 + (ext - 15));
+                if (ext >= 19 && ext <= 22) return dLabel(27, 48 + (ext - 19));
+                if (ext >= 23 && ext <= 26) return dLabel(26, 48 + (ext - 23));
+                if (ext >= 27 && ext <= 30) return dLabel(25, 48 + (ext - 27));
+                if (ext >= 31 && ext <= 34) return dLabel(24, 48 + (ext - 31));
+                return dLabel(23, 48);
+            };
+            auto resolveSample = [&](const std::string& label) -> const vk::Image* {
+                if (label.rfind("ext", 0) == 0) {
+                    const int ext = std::stoi(label.substr(3));
+                    if (ext == 1)  return &ctx->currFrame_;
+                    if (ext == 35) return &ctx->prevFrame_;
+                    return &resourceForD(mappedExternalLabel(ext));
+                }
+                return &resourceForD(label);
+            };
+
+            auto addPass = [&](int shaderIdx,
+                               Ratio passRatio,
+                               const std::vector<std::string>& sampledLabels,
+                               const std::vector<std::string>& storageLabels,
+                               const std::vector<Ratio>& storageRatios) {
+                const VkFormat fmt = storageFormatForShader(shaderIdx);
                 std::vector<vk::Image*> storage;
-                storage.reserve(storageCount);
-                for (uint32_t i = 0; i < storageCount; ++i) {
-                    storage.push_back(fp16Storage ? &next16() : &next8());
+                storage.reserve(storageLabels.size());
+                for (size_t i = 0; i < storageLabels.size(); ++i) {
+                    const Ratio r = storageRatios.empty() ? passRatio : storageRatios[i];
+                    storage.push_back(&allocateResource(storageLabels[i], fmt, extentFor(r)));
                 }
+
+                std::vector<const vk::Image*> sampled;
+                sampled.reserve(sampledLabels.size());
+                for (const auto& label : sampledLabels) sampled.push_back(resolveSample(label));
 
                 ctx->model1GraphPasses_.push_back(
-                    makeModel1Pass(ctx->device_, ctx->descPool_, shaderIdx, ubo,
+                    makeModel1Pass(ctx->device_, ctx->descPool_, shaderIdx, uboForShader(shaderIdx),
                                    sampled, ctx->linearSampler_, storage));
-                for (vk::Image* img : storage) recent.push_back(img);
+                ctx->model1GraphDispatch_.push_back(groupsFor(passRatio));
             };
 
-            // 0x1b004c cluster: runtime-confirmed order (init table entries 0-6)
-            addPass(54, 1, 7, &ctx->uboFlow_); // slot 0x1d80: first, 1 samp, 7 R8 storage
-            addPass(30, 1, 2, nullptr);
-            addPass(31, 2, 2, nullptr);
-            addPass(32, 2, 4, nullptr);
-            addPass(33, 4, 4, nullptr);
-            addPass(34, 12, 2, nullptr);
+            const std::vector<Ratio> pyramidOut = {
+                ratio(1,5), ratio(1,10), ratio(1,20), ratio(1,40),
+                ratio(1,80), ratio(1,160), ratio(1,320),
+            };
+            const std::array<Ratio, 7> expandRatios = {{
+                ratio(2,5), ratio(1,5), ratio(1,10), ratio(1,20),
+                ratio(1,40), ratio(1,80), ratio(1,160),
+            }};
+            const std::array<Ratio, 7> smallRatios = {{
+                ratio(1,5), ratio(1,10), ratio(1,20), ratio(1,40),
+                ratio(1,80), ratio(1,160), ratio(1,320),
+            }};
 
-            // 0x1b0708 main graph (init table entries 6-24, runtime dispatch-confirmed)
-            addPass(35, 2, 2, nullptr);
-            addPass(36, 2, 2, nullptr);
-            addPass(37, 2, 2, nullptr);
-            addPass(38, 2, 6, &ctx->uboFlow_, false); // R8 storage, not fp16
-            addPass(39, 9, 3, &ctx->uboFlow_);
-            addPass(40, 3, 4, nullptr);
-            addPass(41, 4, 4, nullptr);
-            addPass(42, 4, 4, nullptr);
-            addPass(43, 6, 1, &ctx->uboFlow_, true);
-            // Second half (×3/frame tier, runtime-confirmed order)
-            addPass(39, 9, 3, &ctx->uboFlow_);   // shader_39 second pipeline, slot 0x1f60
-            addPass(45, 3, 4, nullptr);
-            addPass(46, 4, 4, nullptr);
-            addPass(47, 4, 4, nullptr);
-            addPass(48, 6, 1, &ctx->uboFlow_, true);
-            // slot 0x2000 = shader_49 (synthesis) — dispatched by passSynth_ below, not here
-            // slots 0x2020-0x2080 = post-synthesis shaders
-            addPass(50, 2, 2, nullptr);
-            addPass(51, 2, 2, nullptr);
-            addPass(52, 2, 2, nullptr);
-            addPass(53, 3, 1, nullptr, true);
-            addPass(55, 5, 1, &ctx->uboFlow_); // slot 0x20c0: last, 5 samp, 1 storage
+            // 0x1a9ed4: shader_03, shader_30 x7, shader_31 x7,
+            // shader_32 x7, shader_33 x7.
+            addPass(3, ratio(1,5), {extLabel(1)}, dLabels(1, 48, 7), pyramidOut);
+            for (int i = 0; i < 7; ++i)
+                addPass(30, expandRatios[size_t(i)], {dLabel(1, 48 + i)}, dLabels(2 + i, 48, 2), {});
+            for (int i = 0; i < 7; ++i)
+                addPass(31, expandRatios[size_t(i)], dLabels(2 + i, 48, 2), dLabels(9 + i, 48, 2), {});
+            for (int i = 0; i < 7; ++i)
+                addPass(32, smallRatios[size_t(i)], dLabels(9 + i, 48, 2), dLabels(16 + i, 48, 4), {});
+            for (int i = 0; i < 7; ++i)
+                addPass(33, smallRatios[size_t(i)], dLabels(16 + i, 48, 4), dLabels(23 + i, 48, 4), {});
 
-            // Stage 0x1b1b10 uses shader_49 as the model-1 synthesis pass;
-            // bind per-output below with the correct alpha UBO.
+            // 0x1b004c: shader_34..38.
+            {
+                auto sampled = extLabels(2, 8);
+                append(sampled, dLabels(23, 48, 4));
+                addPass(34, ratio(1,5), sampled, dLabels(30, 48, 2), {});
+            }
+            addPass(35, ratio(1,5), dLabels(30, 48, 2), dLabels(31, 48, 2), {});
+            addPass(36, ratio(1,5), dLabels(31, 48, 2), dLabels(32, 48, 2), {});
+            addPass(37, ratio(1,5), dLabels(32, 48, 2), dLabels(33, 48, 2), {});
+            addPass(38, ratio(1,10), dLabels(33, 48, 2), dLabels(34, 48, 6), {
+                ratio(1,10), ratio(1,20), ratio(1,40), ratio(1,80), ratio(1,160), ratio(1,320)
+            });
+
+            auto addFivePassRound = [&](Ratio r, int extStart, int srcD,
+                                        const std::string& carry, const std::string& aux,
+                                        int firstDispatch) {
+                auto sampled39 = extLabels(extStart, 4);
+                append(sampled39, dLabels(srcD, 48, 4));
+                sampled39.push_back(carry);
+                addPass(39, r, sampled39, dLabels(firstDispatch, 48, 3), {});
+                addPass(40, r, dLabels(firstDispatch, 48, 3), dLabels(firstDispatch + 1, 48, 4), {});
+                addPass(41, r, dLabels(firstDispatch + 1, 48, 4), dLabels(firstDispatch + 2, 48, 4), {});
+                addPass(42, r, dLabels(firstDispatch + 2, 48, 4), dLabels(firstDispatch + 3, 48, 4), {});
+                auto sampled43 = dLabels(firstDispatch + 3, 48, 4);
+                sampled43.push_back(carry);
+                sampled43.push_back(aux);
+                addPass(43, r, sampled43, dLabels(firstDispatch + 4, 48, 1), {});
+            };
+
+            // 0x1b0708: three 1x1 rounds plus one 2x2 round using shader_39..43.
+            addFivePassRound(ratio(1,320), 10, 29, extLabel(14),      dLabel(34, 53), 35);
+            addFivePassRound(ratio(1,160), 15, 28, dLabel(39, 48),   dLabel(34, 53), 40);
+            addFivePassRound(ratio(1,80),  19, 27, dLabel(44, 48),   dLabel(34, 52), 45);
+            addFivePassRound(ratio(1,40),  23, 26, dLabel(49, 48),   dLabel(34, 51), 50);
+
+            auto addFifteenPassRound = [&](Ratio r, int extStart, int srcD,
+                                           const std::string& carry,
+                                           const std::string& aux,
+                                           const std::string& shader49Extra,
+                                           const std::string& shader53Extra,
+                                           int firstDispatch) {
+                addFivePassRound(r, extStart, srcD, carry, aux, firstDispatch);
+
+                auto sampled44 = extLabels(extStart, 4);
+                append(sampled44, dLabels(srcD, 48, 4));
+                sampled44.push_back(carry);
+                addPass(44, r, sampled44, dLabels(firstDispatch + 5, 48, 3), {});
+                addPass(45, r, dLabels(firstDispatch + 5, 48, 3), dLabels(firstDispatch + 6, 48, 4), {});
+                addPass(46, r, dLabels(firstDispatch + 6, 48, 4), dLabels(firstDispatch + 7, 48, 4), {});
+                addPass(47, r, dLabels(firstDispatch + 7, 48, 4), dLabels(firstDispatch + 8, 48, 4), {});
+                auto sampled48 = dLabels(firstDispatch + 8, 48, 4);
+                sampled48.push_back(carry);
+                sampled48.push_back(aux);
+                addPass(48, r, sampled48, dLabels(firstDispatch + 9, 48, 1), {});
+
+                auto sampled49 = extLabels(extStart, 4);
+                append(sampled49, dLabels(srcD, 48, 4));
+                sampled49.push_back(carry);
+                sampled49.push_back(shader49Extra);
+                addPass(49, r, sampled49, dLabels(firstDispatch + 10, 48, 2), {});
+                addPass(50, r, dLabels(firstDispatch + 10, 48, 2), dLabels(firstDispatch + 11, 48, 2), {});
+                addPass(51, r, dLabels(firstDispatch + 11, 48, 2), dLabels(firstDispatch + 12, 48, 2), {});
+                addPass(52, r, dLabels(firstDispatch + 12, 48, 2), dLabels(firstDispatch + 13, 48, 2), {});
+                auto sampled53 = dLabels(firstDispatch + 13, 48, 2);
+                sampled53.push_back(shader53Extra);
+                addPass(53, r, sampled53, dLabels(firstDispatch + 14, 48, 1), {});
+            };
+
+            addFifteenPassRound(ratio(1,20), 27, 25, dLabel(54, 48), dLabel(34, 50),
+                                extLabel(14), extLabel(14), 55);
+            addFifteenPassRound(ratio(1,10), 31, 24, dLabel(59, 48), dLabel(34, 49),
+                                dLabel(64, 48), dLabel(69, 48), 70);
+            addFifteenPassRound(ratio(1,5), 6, 23, dLabel(74, 48), dLabel(34, 48),
+                                dLabel(79, 48), dLabel(84, 48), 85);
+
+            // Final full-resolution shader_04. The traced native path then
+            // performs a barrier/copy/barrier in 0x1b1b10; as a layer we bind
+            // the storage output directly to the generated AHB image and let
+            // layer.cpp blit it into swapchain images.
+            ctx->model1FinalPassStart_ = ctx->model1GraphPasses_.size();
+            for (uint32_t k = 0; k < outputs; ++k) {
+                std::vector<const vk::Image*> sampled = {
+                    &ctx->prevFrame_,
+                    &ctx->currFrame_,
+                    &resourceForD(dLabel(89, 48)),
+                    &resourceForD(dLabel(94, 48)),
+                    &resourceForD(dLabel(99, 48)),
+                };
+                std::vector<vk::Image*> storage = {&ctx->outputImages_[k]};
+                ctx->model1GraphPasses_.push_back(
+                    makeModel1Pass(ctx->device_, ctx->descPool_, 4, &ctx->uboSynth_[k],
+                                   sampled, ctx->linearSampler_, storage));
+                ctx->model1GraphDispatch_.push_back(groupsFor(ratio(1,1)));
+            }
+
+            BFG_LOGI("model=1 graph: %zu passes, %zu resources, finalStart=%zu",
+                     ctx->model1GraphPasses_.size(), ctx->model1Resources_.size(),
+                     ctx->model1FinalPassStart_);
         }
 
         // ── Model-0 stages: skip entirely for model=1 (has its own graph above) ──
@@ -551,11 +716,9 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
         ctx->passWarpBlend_.reserve(outputs);
         ctx->passSynth_.reserve(outputs);
         for (uint32_t k = 0; k < outputs; ++k) {
-            // shader_14 generates the per-alpha occlusion/confidence map used by
-            // shader_04. Model 1 uses shader_39 when requested; its wider layout
-            // accepts additional context inputs, so bind the strongest available
-            // flow/feature intermediates into b37-b40.
-            const bool model1 = ctx->cfg_.model == 1;
+            // shader_14/20 generate the per-alpha occlusion/confidence map used
+            // by shader_04 in the model-0 path. Model-1 never reaches this
+            // block; it has its own traced graph above.
             std::vector<vk::DescriptorBinding> wbBinds = {
                 {0,  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
                 {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
@@ -567,13 +730,7 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
                 {49, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
                 {50, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
             };
-            if (model1) {
-                wbBinds.push_back({37, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1});
-                wbBinds.push_back({38, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1});
-                wbBinds.push_back({39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1});
-                wbBinds.push_back({40, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1});
-            }
-            const int warpShader = model1 ? ((k & 1u) ? 44 : 39) : ((k & 1u) ? 20 : 14);
+            const int warpShader = (k & 1u) ? 20 : 14;
             ctx->passWarpBlend_.emplace_back(ctx->device_, ctx->descPool_, warpShader, wbBinds);
             auto& pw = ctx->passWarpBlend_.back();
             pw.bindUBO    (ctx->device_, 0,  ctx->uboSynth_[k]);
@@ -582,70 +739,28 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
             pw.bindSampled(ctx->device_, 34, ctx->flowExpA_,     ctx->linearSampler_);
             pw.bindSampled(ctx->device_, 35, ctx->flowExpB_,     ctx->linearSampler_);
             pw.bindSampled(ctx->device_, 36, ctx->confidence_,   ctx->linearSampler_);
-            if (model1) {
-                pw.bindSampled(ctx->device_, 37, ctx->flowRefinedFwd_, ctx->linearSampler_);
-                pw.bindSampled(ctx->device_, 38, ctx->flowRefinedBwd_, ctx->linearSampler_);
-                pw.bindSampled(ctx->device_, 39, ctx->flowMerged_,     ctx->linearSampler_);
-                pw.bindSampled(ctx->device_, 40, ctx->featA_,          ctx->linearSampler_);
-            }
             pw.bindStorage(ctx->device_, 48, ctx->warpedPrev_);
             pw.bindStorage(ctx->device_, 49, ctx->warpedCurr_);
             pw.bindStorage(ctx->device_, 50, ctx->confidenceMap_);
 
-            if (model1) {
-                std::vector<vk::DescriptorBinding> binds = {
-                    {0,  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-                    {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {35, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {36, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {37, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {38, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {40, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
-                    {49, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
-                };
-                ctx->passSynth_.emplace_back(ctx->device_, ctx->descPool_, 49, binds);
-                auto& ps = ctx->passSynth_.back();
-                ps.bindUBO    (ctx->device_, 0,  ctx->uboSynth_[k]);
-                ps.bindSampled(ctx->device_, 32, ctx->prevFrame_,      ctx->linearSampler_);
-                ps.bindSampled(ctx->device_, 33, ctx->currFrame_,      ctx->linearSampler_);
-                // Synthesis inputs: slot 0x2000 = shader_49 IS this synthesis pass.
-                // Reads the last 8 outputs from model1GraphPasses_:
-                //   s16[2]=sh53  s8[68,67]=sh52  s8[66,65]=sh51  s8[64,63]=sh50  s16[1]=sh48
-                ps.bindSampledGeneral(ctx->device_, 34, ctx->model1Scratch16_[2],  ctx->linearSampler_); // sh53
-                ps.bindSampledGeneral(ctx->device_, 35, ctx->model1Scratch8_[68],  ctx->linearSampler_); // sh52
-                ps.bindSampledGeneral(ctx->device_, 36, ctx->model1Scratch8_[67],  ctx->linearSampler_); // sh52
-                ps.bindSampledGeneral(ctx->device_, 37, ctx->model1Scratch8_[66],  ctx->linearSampler_); // sh51
-                ps.bindSampledGeneral(ctx->device_, 38, ctx->model1Scratch8_[65],  ctx->linearSampler_); // sh51
-                ps.bindSampledGeneral(ctx->device_, 39, ctx->model1Scratch8_[64],  ctx->linearSampler_); // sh50
-                ps.bindSampledGeneral(ctx->device_, 40, ctx->model1Scratch8_[63],  ctx->linearSampler_); // sh50
-                ps.bindSampledGeneral(ctx->device_, 41, ctx->model1Scratch16_[1],  ctx->linearSampler_); // sh48
-                ps.bindStorage(ctx->device_, 48, ctx->outputImages_[k]);
-                ps.bindStorage(ctx->device_, 49, ctx->model1SynthAux_);
-            } else {
-                std::vector<vk::DescriptorBinding> binds = {
-                    {0,  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-                    {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {35, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {36, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-                    {48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
-                };
-                ctx->passSynth_.emplace_back(ctx->device_, ctx->descPool_, 4, binds);
-                auto& ps = ctx->passSynth_.back();
-                ps.bindUBO    (ctx->device_, 0,  ctx->uboSynth_[k]);
-                ps.bindSampled(ctx->device_, 32, ctx->prevFrame_,      ctx->linearSampler_);
-                ps.bindSampled(ctx->device_, 33, ctx->currFrame_,      ctx->linearSampler_);
-                ps.bindSampled(ctx->device_, 34, ctx->flowExpA_,       ctx->linearSampler_);
-                ps.bindSampled(ctx->device_, 35, ctx->flowExpB_,       ctx->linearSampler_);
-                ps.bindSampled(ctx->device_, 36, ctx->confidenceMap_,  ctx->linearSampler_);
-                ps.bindStorage(ctx->device_, 48, ctx->outputImages_[k]);
-            }
+            std::vector<vk::DescriptorBinding> binds = {
+                {0,  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+                {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                {33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                {34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                {35, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                {36, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                {48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
+            };
+            ctx->passSynth_.emplace_back(ctx->device_, ctx->descPool_, 4, binds);
+            auto& ps = ctx->passSynth_.back();
+            ps.bindUBO    (ctx->device_, 0,  ctx->uboSynth_[k]);
+            ps.bindSampled(ctx->device_, 32, ctx->prevFrame_,      ctx->linearSampler_);
+            ps.bindSampled(ctx->device_, 33, ctx->currFrame_,      ctx->linearSampler_);
+            ps.bindSampled(ctx->device_, 34, ctx->flowExpA_,       ctx->linearSampler_);
+            ps.bindSampled(ctx->device_, 35, ctx->flowExpB_,       ctx->linearSampler_);
+            ps.bindSampled(ctx->device_, 36, ctx->confidenceMap_,  ctx->linearSampler_);
+            ps.bindStorage(ctx->device_, 48, ctx->outputImages_[k]);
         }
 
         } // end !useModel1 model-0 stages
@@ -672,6 +787,16 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
 }
 
 void FramegenContext::rebindFrameInputs() {
+    if (cfg_.model == 1) {
+        if (!model1GraphPasses_.empty())
+            model1GraphPasses_[0].bindSampledGeneral(device_, 32, currFrame_, linearSampler_); // shader_03 ext1
+        for (size_t i = model1FinalPassStart_; i < model1GraphPasses_.size(); ++i) {
+            model1GraphPasses_[i].bindSampledGeneral(device_, 32, prevFrame_, linearSampler_); // shader_04 ext35
+            model1GraphPasses_[i].bindSampledGeneral(device_, 33, currFrame_, linearSampler_); // shader_04 ext1
+        }
+        return;
+    }
+
     passPyramidA_.bindSampled(device_, 32, currFrame_, linearSampler_);
     passPyramidB_.bindSampled(device_, 32, prevFrame_, linearSampler_);
     passFeatA_.bindSampled(device_, 32, currFrame_, linearSampler_);
@@ -679,13 +804,6 @@ void FramegenContext::rebindFrameInputs() {
     for (auto& pw : passWarpBlend_) {
         pw.bindSampled(device_, 32, prevFrame_, linearSampler_);
         pw.bindSampled(device_, 33, currFrame_, linearSampler_);
-    }
-    if (cfg_.model == 1 && model1GraphPasses_.size() >= 5) {
-        model1GraphPasses_[0].bindSampledGeneral(device_, 32, currFrame_, linearSampler_);
-        model1GraphPasses_[1].bindSampledGeneral(device_, 32, prevFrame_, linearSampler_);
-        model1GraphPasses_[1].bindSampledGeneral(device_, 33, currFrame_, linearSampler_);
-        model1GraphPasses_[4].bindSampledGeneral(device_, 32, prevFrame_, linearSampler_);
-        model1GraphPasses_[4].bindSampledGeneral(device_, 33, currFrame_, linearSampler_);
     }
     for (auto& ps : passSynth_) {
         ps.bindSampled(device_, 32, prevFrame_, linearSampler_);
@@ -719,30 +837,28 @@ void FramegenContext::present(AHardwareBuffer* newPrev, AHardwareBuffer* newCurr
     if (currFrame_.external()) vk::acquireFromExternal(cmd, currFrame_, device_.computeFamily(), VK_ACCESS_SHADER_READ_BIT);
 
     if (cfg_.model == 1) {
-        // Runtime-confirmed model-1 stage order:
-        // 1a9ed4(resource/ring) -> 1afe28(warmup) -> 1b004c(first cluster)
-        // -> 1b0708(main graph) -> 1b1b10(final synthesis/copy). Resource
-        // stages are represented by persistent allocations above; command
-        // emission is the model1GraphPasses_ table followed by shader_49.
-        for (auto& img : model1Scratch8_)  toStorage(cmd, img);
-        for (auto& img : model1Scratch16_) toStorage(cmd, img);
-        toStorage(cmd, model1SynthAux_);
+        // Runtime-confirmed steady-state Model-1 order:
+        // 0x1a9ed4 -> 0x1afe28(no compute) -> 0x1b004c -> 0x1b0708
+        // -> 0x1b1b10(copy/barrier). We emit the 99 internal dispatches plus
+        // final shader_04 directly into the layer's generated AHB image.
+        for (auto& img : model1Resources_) toStorage(cmd, img);
+        for (auto& out : outputImages_) {
+            if (out.external())
+                vk::acquireFromExternal(cmd, out, device_.computeFamily(), VK_ACCESS_SHADER_WRITE_BIT);
+            toStorage(cmd, out);
+        }
 
-        for (auto& p : model1GraphPasses_) {
-            p.dispatch(cmd, (W+15)/16, (H+15)/16);
+        const size_t passCount = std::min(model1GraphPasses_.size(), model1GraphDispatch_.size());
+        for (size_t i = 0; i < passCount; ++i) {
+            const VkExtent2D g = model1GraphDispatch_[i];
+            model1GraphPasses_[i].dispatch(cmd, g.width, g.height);
             computeBarrier(cmd);
         }
 
-        for (size_t k = 0; k < passSynth_.size(); ++k) {
-            if (outputImages_[k].external())
-                vk::acquireFromExternal(cmd, outputImages_[k], device_.computeFamily(), VK_ACCESS_SHADER_WRITE_BIT);
-            toStorage(cmd, outputImages_[k]);
-            passSynth_[k].dispatch(cmd, (W+15)/16, (H+15)/16);
-            computeBarrier(cmd);
-            if (outputImages_[k].external())
-                vk::releaseToExternal(cmd, outputImages_[k], device_.computeFamily(), VK_ACCESS_SHADER_WRITE_BIT);
+        for (auto& out : outputImages_) {
+            if (out.external())
+                vk::releaseToExternal(cmd, out, device_.computeFamily(), VK_ACCESS_SHADER_WRITE_BIT);
         }
-
         if (prevFrame_.external()) vk::releaseToExternal(cmd, prevFrame_, device_.computeFamily(), VK_ACCESS_SHADER_READ_BIT);
         if (currFrame_.external()) vk::releaseToExternal(cmd, currFrame_, device_.computeFamily(), VK_ACCESS_SHADER_READ_BIT);
 
@@ -819,11 +935,6 @@ void FramegenContext::present(AHardwareBuffer* newPrev, AHardwareBuffer* newCurr
         passWarpBlend_[k].dispatch(cmd, (W+15)/16, (H+15)/16);
         computeBarrier(cmd);
         toShaderRead(cmd, confidenceMap_);
-        if (cfg_.model == 1) {
-            toShaderRead(cmd, warpedPrev_);
-            toShaderRead(cmd, warpedCurr_);
-            toStorage(cmd, model1SynthAux_);
-        }
 
         if (outputImages_[k].external())
             vk::acquireFromExternal(cmd, outputImages_[k], device_.computeFamily(), VK_ACCESS_SHADER_WRITE_BIT);
@@ -875,6 +986,8 @@ void FramegenContext::destroy() {
     for (auto& p:passWarpBlend_) p.destroy(device_); passWarpBlend_.clear();
     for (auto& p:passSynth_) p.destroy(device_); passSynth_.clear();
     for (auto& p:model1GraphPasses_) p.destroy(device_); model1GraphPasses_.clear();
+    model1GraphDispatch_.clear();
+    model1FinalPassStart_ = 0;
     uboPyramid_.destroy(device_); uboFlow_.destroy(device_);
     for (auto& b:uboSynth_) b.destroy(device_); uboSynth_.clear();
     // Images
@@ -890,9 +1003,7 @@ void FramegenContext::destroy() {
     flowExpA_.destroy(device_); flowExpB_.destroy(device_);
     confidence_.destroy(device_); warpedPrev_.destroy(device_);
     warpedCurr_.destroy(device_); confidenceMap_.destroy(device_);
-    model1SynthAux_.destroy(device_);
-    for (auto& i:model1Scratch8_) i.destroy(device_); model1Scratch8_.clear();
-    for (auto& i:model1Scratch16_) i.destroy(device_); model1Scratch16_.clear();
+    for (auto& i:model1Resources_) i.destroy(device_); model1Resources_.clear();
     if (descPool_) vkDestroyDescriptorPool(device_.handle(), descPool_, nullptr);
     descPool_ = VK_NULL_HANDLE;
     linearSampler_.destroy(device_); nearestSampler_.destroy(device_);
