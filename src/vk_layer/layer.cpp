@@ -15,11 +15,15 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -27,6 +31,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -81,14 +86,28 @@ struct LayerConf {
     int         multiplier = 2;
     float       flowScale  = 0.6f;
     int         model      = 0;
+    bool        debugTiming = false;
+    int         debugSummaryEvery = 60;
+    bool        pacePresent = false;
+    double      paceIntervalMs = 8.333;
     std::string configPath;
     int64_t     configStamp = 0;
 };
 
 static constexpr int kMaxHotReloadMultiplier = 4;
 static constexpr int kMaxHotReloadGeneratedFrames = kMaxHotReloadMultiplier - 1;
+static constexpr int kMaxHotReloadPresentOps = kMaxHotReloadMultiplier;
 static constexpr uint32_t kHotReloadProvisionedSwapchainImages =
     static_cast<uint32_t>(kMaxHotReloadMultiplier + 1);
+
+static int64_t steadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static double nsToMs(int64_t ns) {
+    return static_cast<double>(ns) / 1000000.0;
+}
 
 static std::string trim(std::string s) {
     auto notSpace = [](unsigned char ch) { return !std::isspace(ch); };
@@ -185,6 +204,14 @@ static void parseConfigFile(const std::string& path, LayerConf& c) {
                 c.flowScale = std::max(0.2f, std::min(1.0f, static_cast<float>(std::atof(unquote(value).c_str()))));
             } else if (key == "model") {
                 c.model = std::max(0, std::min(1, std::atoi(unquote(value).c_str())));
+            } else if (key == "debug_timing" || key == "debugtiming") {
+                c.debugTiming = parseBool(value, c.debugTiming);
+            } else if (key == "debug_summary_every" || key == "debugsummaryevery") {
+                c.debugSummaryEvery = std::max(1, std::min(600, std::atoi(unquote(value).c_str())));
+            } else if (key == "pace_present" || key == "pacepresent") {
+                c.pacePresent = parseBool(value, c.pacePresent);
+            } else if (key == "pace_interval_ms" || key == "paceintervalms") {
+                c.paceIntervalMs = std::max(1.0, std::min(50.0, std::atof(unquote(value).c_str())));
             }
         } catch (...) {
             BFG_LAYER_E("Ignoring invalid config value: %s", line.c_str());
@@ -208,6 +235,14 @@ static LayerConf readConf() {
         c.flowScale = std::max(0.2f, std::min(1.0f, static_cast<float>(std::atof(v))));
     if (auto* v = std::getenv("BIONIC_FG_MODEL"))
         c.model = std::max(0, std::min(1, std::atoi(v)));
+    if (auto* v = std::getenv("BIONIC_FG_DEBUG_TIMING"))
+        c.debugTiming = parseBool(v, c.debugTiming);
+    if (auto* v = std::getenv("BIONIC_FG_DEBUG_SUMMARY_EVERY"))
+        c.debugSummaryEvery = std::max(1, std::min(600, std::atoi(v)));
+    if (auto* v = std::getenv("BIONIC_FG_PACE_PRESENT"))
+        c.pacePresent = parseBool(v, c.pacePresent);
+    if (auto* v = std::getenv("BIONIC_FG_PACE_INTERVAL_MS"))
+        c.paceIntervalMs = std::max(1.0, std::min(50.0, std::atof(v)));
 
     c.configPath = defaultConfigPath();
     if (!c.configPath.empty()) {
@@ -408,13 +443,35 @@ struct SwapState {
     uint32_t        copyQueueFamily = VK_QUEUE_FAMILY_IGNORED;
     VkCommandBuffer copyCmds[2]= {};
     VkFence         copyFences[2]={};
-    VkCommandBuffer genCmds[4] = {};    // one per possible generated frame
+    VkCommandBuffer genCmds[4] = {};    // one per possible presented output slot
     VkFence         genFences[4] = {};
     VkSemaphore     acquireSems[4] = {};
     VkSemaphore     presentSems[4] = {};
 
     uint64_t frameCount = 0;
     bool     inPresent  = false;
+
+    uint64_t debugSourceSeq = 0;
+    uint64_t debugOutputSeq = 0;
+    uint32_t debugTraceFramesRemaining = 24;
+    int64_t  debugLastSourceStartNs = 0;
+    int64_t  debugLastOutputPresentNs = 0;
+    double   debugOutputGapSumNs = 0.0;
+    uint64_t debugOutputGapCount = 0;
+    int64_t  debugOutputGapMinNs = 0;
+    int64_t  debugOutputGapMaxNs = 0;
+    uint64_t debugOutputGapUnder10ms = 0;
+    uint64_t debugOutputGapUnder20ms = 0;
+    uint64_t debugOutputGapOver20ms = 0;
+    double   debugAcquireWaitSumNs = 0.0;
+    uint64_t debugAcquireWaitCount = 0;
+    int64_t  debugAcquireWaitMaxNs = 0;
+    double   debugFramegenSumNs = 0.0;
+    uint64_t debugFramegenCount = 0;
+    int64_t  debugFramegenMaxNs = 0;
+    double   debugCallbackSumNs = 0.0;
+    uint64_t debugCallbackCount = 0;
+    int64_t  debugCallbackMaxNs = 0;
 
     void cleanup(const DeviceData& dd, VkDevice dev) {
         if (dd.deviceWaitIdle) dd.deviceWaitIdle(dev);
@@ -455,13 +512,24 @@ static std::unique_ptr<bionic_fg::FramegenContext> createFramegenContext(
         const SwapState& st,
         const LayerConf& conf) {
     DisableLayerEnvGuard disableLayerForInternalVulkan;
-    return bionic_fg::FramegenContext::create(
+    const int64_t t0 = steadyNowNs();
+    auto ctx = bionic_fg::FramegenContext::create(
         st.prevAhb,
         st.currAhb,
         st.outAhbs,
         st.extent,
         st.format,
         makeFramegenConfig(st, conf));
+    BFG_LAYER("FramegenContext create mult=%d flow=%.2f model=%d result=%s took=%.3fms",
+              conf.multiplier, conf.flowScale, conf.model,
+              ctx ? "ok" : "null", nsToMs(steadyNowNs() - t0));
+    return ctx;
+}
+
+static void resetFrameHistory(SwapState& st) {
+    st.frameCount = 0;
+    st.debugTraceFramesRemaining = 24;
+    st.debugLastSourceStartNs = 0;
 }
 
 static bool rebuildFramegenContext(SwapState& st, const LayerConf& conf) {
@@ -483,6 +551,7 @@ static bool rebuildFramegenContext(SwapState& st, const LayerConf& conf) {
         st.fgCtx->destroy();
     }
     st.fgCtx = std::move(newCtx);
+    resetFrameHistory(st);
     BFG_LAYER("FramegenContext rebuilt: mult=%d flow=%.2f model=%d",
               conf.multiplier, conf.flowScale, conf.model);
     return true;
@@ -492,6 +561,7 @@ static bool rebuildFramegenContext(SwapState& st, const LayerConf& conf) {
 // ─── Global state ─────────────────────────────────────────────────────────────
 
 static std::mutex g_mtx;
+static std::mutex g_queueHostMtx;
 static std::unordered_map<void*, InstanceData> g_instances;
 static std::unordered_map<void*, DeviceData>   g_devices;
 static std::unordered_map<VkPhysicalDevice, VkInstance> g_physInstances;
@@ -499,6 +569,217 @@ struct QueueData { void* deviceKey = nullptr; uint32_t family = VK_QUEUE_FAMILY_
 static std::unordered_map<VkQueue, QueueData> g_queues;
 static std::unordered_map<VkSwapchainKHR, SwapState> g_swapchains;
 static std::unordered_map<VkSwapchainKHR, void*>     g_swapDevice;
+
+static VkResult queueSubmitLocked(const DeviceData& dd, VkQueue queue,
+                                  uint32_t submitCount, const VkSubmitInfo* submits,
+                                  VkFence fence) {
+    std::lock_guard<std::mutex> lk(g_queueHostMtx);
+    return dd.queueSubmit(queue, submitCount, submits, fence);
+}
+
+static VkResult queuePresentLocked(PFN_vkQueuePresentKHR present, VkQueue queue,
+                                   const VkPresentInfoKHR* presentInfo) {
+    std::lock_guard<std::mutex> lk(g_queueHostMtx);
+    return present(queue, presentInfo);
+}
+
+static VkResult queuePresentLocked(const DeviceData& dd, VkQueue queue,
+                                   const VkPresentInfoKHR* presentInfo) {
+    return queuePresentLocked(dd.queuePresent, queue, presentInfo);
+}
+
+#ifdef __ANDROID__
+struct ScheduledPresent {
+    int64_t targetNs = 0;
+    int64_t intervalNs = 0;
+    PFN_vkQueuePresentKHR present = nullptr;
+    VkQueue queue = VK_NULL_HANDLE;
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    uint32_t imageIndex = UINT32_MAX;
+    uint64_t sourceSeq = 0;
+    int slot = 0;
+    char label[16] = {};
+};
+
+static std::mutex g_presentSchedulerMtx;
+static std::condition_variable g_presentSchedulerCv;
+static std::deque<ScheduledPresent> g_presentSchedulerQueue;
+static std::thread g_presentSchedulerThread;
+static bool g_presentSchedulerStarted = false;
+static int64_t g_presentSchedulerLastPresentNs = 0;
+static uint64_t g_presentSchedulerSeq = 0;
+
+static void presentSchedulerLoop() {
+    for (;;) {
+        ScheduledPresent item;
+        {
+            std::unique_lock<std::mutex> lk(g_presentSchedulerMtx);
+            g_presentSchedulerCv.wait(lk, [] { return !g_presentSchedulerQueue.empty(); });
+            for (;;) {
+                auto best = g_presentSchedulerQueue.begin();
+                for (auto it = g_presentSchedulerQueue.begin(); it != g_presentSchedulerQueue.end(); ++it)
+                    if (it->targetNs < best->targetNs) best = it;
+                int64_t effectiveTargetNs = best->targetNs;
+                if (g_presentSchedulerLastPresentNs != 0 && best->intervalNs > 0)
+                    effectiveTargetNs = std::max(effectiveTargetNs, g_presentSchedulerLastPresentNs + best->intervalNs);
+                const int64_t nowNs = steadyNowNs();
+                if (effectiveTargetNs > nowNs) {
+                    g_presentSchedulerCv.wait_for(lk, std::chrono::nanoseconds(effectiveTargetNs - nowNs));
+                    continue;
+                }
+                item = *best;
+                g_presentSchedulerQueue.erase(best);
+                break;
+            }
+        }
+
+        int64_t effectiveTargetNs = item.targetNs;
+        {
+            std::lock_guard<std::mutex> lk(g_presentSchedulerMtx);
+            if (g_presentSchedulerLastPresentNs != 0 && item.intervalNs > 0)
+                effectiveTargetNs = std::max(effectiveTargetNs, g_presentSchedulerLastPresentNs + item.intervalNs);
+        }
+        const int64_t nowBeforePresentNs = steadyNowNs();
+        if (effectiveTargetNs > nowBeforePresentNs)
+            std::this_thread::sleep_for(std::chrono::nanoseconds(effectiveTargetNs - nowBeforePresentNs));
+
+        VkPresentInfoKHR presentInfo{};
+        presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        presentInfo.swapchainCount = 1;
+        presentInfo.pSwapchains = &item.swapchain;
+        presentInfo.pImageIndices = &item.imageIndex;
+
+        const int64_t presentStartNs = steadyNowNs();
+        VkResult res = item.present
+            ? queuePresentLocked(item.present, item.queue, &presentInfo)
+            : VK_ERROR_INITIALIZATION_FAILED;
+        const int64_t presentEndNs = steadyNowNs();
+        double gapMs = -1.0;
+        {
+            std::lock_guard<std::mutex> lk(g_presentSchedulerMtx);
+            if (g_presentSchedulerLastPresentNs != 0)
+                gapMs = nsToMs(presentEndNs - g_presentSchedulerLastPresentNs);
+            g_presentSchedulerLastPresentNs = presentEndNs;
+        }
+        const uint64_t seq = ++g_presentSchedulerSeq;
+        BFG_LAYER("paced present#%llu src#%llu %s slot=%d img=%u targetErr=%.3fms origErr=%.3fms present=%.3fms gapPrev=%.3fms res=%d",
+                  static_cast<unsigned long long>(seq),
+                  static_cast<unsigned long long>(item.sourceSeq),
+                  item.label,
+                  item.slot,
+                  item.imageIndex,
+                  nsToMs(presentStartNs - effectiveTargetNs),
+                  nsToMs(presentStartNs - item.targetNs),
+                  nsToMs(presentEndNs - presentStartNs),
+                  gapMs,
+                  static_cast<int>(res));
+    }
+}
+
+static void ensurePresentSchedulerStarted() {
+    std::lock_guard<std::mutex> lk(g_presentSchedulerMtx);
+    if (g_presentSchedulerStarted) return;
+    g_presentSchedulerStarted = true;
+    g_presentSchedulerThread = std::thread(presentSchedulerLoop);
+    g_presentSchedulerThread.detach();
+}
+
+static void schedulePresent(const ScheduledPresent& item) {
+    ensurePresentSchedulerStarted();
+    {
+        std::lock_guard<std::mutex> lk(g_presentSchedulerMtx);
+        g_presentSchedulerQueue.push_back(item);
+    }
+    g_presentSchedulerCv.notify_one();
+}
+
+static void cancelScheduledPresents(VkSwapchainKHR swapchain) {
+    std::lock_guard<std::mutex> lk(g_presentSchedulerMtx);
+    for (auto it = g_presentSchedulerQueue.begin(); it != g_presentSchedulerQueue.end(); ) {
+        if (it->swapchain == swapchain) it = g_presentSchedulerQueue.erase(it);
+        else ++it;
+    }
+}
+
+static void debugRecordAcquireWait(SwapState& st, int64_t waitNs) {
+    if (!st.conf.debugTiming) return;
+    st.debugAcquireWaitSumNs += static_cast<double>(waitNs);
+    st.debugAcquireWaitCount++;
+    st.debugAcquireWaitMaxNs = std::max(st.debugAcquireWaitMaxNs, waitNs);
+}
+
+static void debugRecordFramegenTime(SwapState& st, int64_t fgNs) {
+    if (!st.conf.debugTiming) return;
+    st.debugFramegenSumNs += static_cast<double>(fgNs);
+    st.debugFramegenCount++;
+    st.debugFramegenMaxNs = std::max(st.debugFramegenMaxNs, fgNs);
+}
+
+static void debugRecordCallbackTime(SwapState& st, int64_t callbackNs) {
+    if (!st.conf.debugTiming) return;
+    st.debugCallbackSumNs += static_cast<double>(callbackNs);
+    st.debugCallbackCount++;
+    st.debugCallbackMaxNs = std::max(st.debugCallbackMaxNs, callbackNs);
+}
+
+static double debugRecordOutputPresent(SwapState& st, int64_t presentNs) {
+    if (!st.conf.debugTiming) return -1.0;
+
+    double gapMs = -1.0;
+    if (st.debugLastOutputPresentNs != 0) {
+        int64_t gapNs = presentNs - st.debugLastOutputPresentNs;
+        gapMs = nsToMs(gapNs);
+        st.debugOutputGapSumNs += static_cast<double>(gapNs);
+        st.debugOutputGapCount++;
+        st.debugOutputGapMinNs = (st.debugOutputGapMinNs == 0)
+            ? gapNs
+            : std::min(st.debugOutputGapMinNs, gapNs);
+        st.debugOutputGapMaxNs = std::max(st.debugOutputGapMaxNs, gapNs);
+        if (gapMs < 10.0) st.debugOutputGapUnder10ms++;
+        else if (gapMs < 20.0) st.debugOutputGapUnder20ms++;
+        else st.debugOutputGapOver20ms++;
+    }
+    st.debugLastOutputPresentNs = presentNs;
+    st.debugOutputSeq++;
+
+    if (st.conf.debugSummaryEvery > 0 && st.debugOutputSeq > 0 &&
+        (st.debugOutputSeq % static_cast<uint64_t>(st.conf.debugSummaryEvery) == 0)) {
+        const double avgGapMs = st.debugOutputGapCount > 0
+            ? nsToMs(static_cast<int64_t>(st.debugOutputGapSumNs / static_cast<double>(st.debugOutputGapCount)))
+            : 0.0;
+        const double avgAcquireMs = st.debugAcquireWaitCount > 0
+            ? nsToMs(static_cast<int64_t>(st.debugAcquireWaitSumNs / static_cast<double>(st.debugAcquireWaitCount)))
+            : 0.0;
+        const double avgFgMs = st.debugFramegenCount > 0
+            ? nsToMs(static_cast<int64_t>(st.debugFramegenSumNs / static_cast<double>(st.debugFramegenCount)))
+            : 0.0;
+        const double avgCallbackMs = st.debugCallbackCount > 0
+            ? nsToMs(static_cast<int64_t>(st.debugCallbackSumNs / static_cast<double>(st.debugCallbackCount)))
+            : 0.0;
+        const uint64_t totalGapBuckets = st.debugOutputGapUnder10ms + st.debugOutputGapUnder20ms + st.debugOutputGapOver20ms;
+        const double under10Pct = totalGapBuckets > 0 ? (100.0 * static_cast<double>(st.debugOutputGapUnder10ms) / static_cast<double>(totalGapBuckets)) : 0.0;
+        const double under20Pct = totalGapBuckets > 0 ? (100.0 * static_cast<double>(st.debugOutputGapUnder20ms) / static_cast<double>(totalGapBuckets)) : 0.0;
+        const double over20Pct = totalGapBuckets > 0 ? (100.0 * static_cast<double>(st.debugOutputGapOver20ms) / static_cast<double>(totalGapBuckets)) : 0.0;
+        BFG_LAYER(
+            "timing summary outputs=%llu gaps<10=%.1f%% gaps10to20=%.1f%% gaps>=20=%.1f%% gapAvg=%.3fms gapMin=%.3fms gapMax=%.3fms acquireAvg=%.3fms acquireMax=%.3fms fgAvg=%.3fms fgMax=%.3fms cbAvg=%.3fms cbMax=%.3fms",
+            static_cast<unsigned long long>(st.debugOutputSeq),
+            under10Pct,
+            under20Pct,
+            over20Pct,
+            avgGapMs,
+            nsToMs(st.debugOutputGapMinNs),
+            nsToMs(st.debugOutputGapMaxNs),
+            avgAcquireMs,
+            nsToMs(st.debugAcquireWaitMaxNs),
+            avgFgMs,
+            nsToMs(st.debugFramegenMaxNs),
+            avgCallbackMs,
+            nsToMs(st.debugCallbackMaxNs));
+    }
+
+    return gapMs;
+}
+#endif
 
 // ─── Barrier helper ───────────────────────────────────────────────────────────
 
@@ -772,6 +1053,25 @@ VKAPI_ATTR void VKAPI_CALL BionicFG_GetDeviceQueue2(
     }
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueueSubmit(
+        VkQueue queue,
+        uint32_t submitCount,
+        const VkSubmitInfo* pSubmits,
+        VkFence fence) {
+    DeviceData dd;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto qit = g_queues.find(queue);
+        if (qit == g_queues.end() || !qit->second.deviceKey)
+            return vkQueueSubmit(queue, submitCount, pSubmits, fence);
+        auto it = g_devices.find(qit->second.deviceKey);
+        if (it == g_devices.end() || !it->second.queueSubmit)
+            return vkQueueSubmit(queue, submitCount, pSubmits, fence);
+        dd = it->second;
+    }
+    return queueSubmitLocked(dd, queue, submitCount, pSubmits, fence);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL BionicFG_AcquireNextImage2KHR(
         VkDevice device, const VkAcquireNextImageInfoKHR* pAcquireInfo,
         uint32_t* pImageIndex) {
@@ -904,9 +1204,9 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
         cbai.commandBufferCount = 2;
         if (dd.allocCmdBufs(device, &cbai, st.copyCmds) != VK_SUCCESS)
             throw std::runtime_error("failed to allocate copy command buffers");
-        cbai.commandBufferCount = kMaxHotReloadGeneratedFrames;
+        cbai.commandBufferCount = kMaxHotReloadPresentOps;
         if (dd.allocCmdBufs(device, &cbai, st.genCmds) != VK_SUCCESS)
-            throw std::runtime_error("failed to allocate generated-frame command buffers");
+            throw std::runtime_error("failed to allocate output command buffers");
 
         VkFenceCreateInfo fci{};
         fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -914,17 +1214,17 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
         if (dd.createFence(device, &fci, nullptr, &st.copyFences[0]) != VK_SUCCESS ||
             dd.createFence(device, &fci, nullptr, &st.copyFences[1]) != VK_SUCCESS)
             throw std::runtime_error("failed to create copy fences");
-        for (int k = 0; k < kMaxHotReloadGeneratedFrames && k < 4; ++k) {
+        for (int k = 0; k < kMaxHotReloadPresentOps && k < 4; ++k) {
             if (dd.createFence(device, &fci, nullptr, &st.genFences[k]) != VK_SUCCESS)
-                throw std::runtime_error("failed to create generated-frame fence");
+                throw std::runtime_error("failed to create output fence");
         }
 
         VkSemaphoreCreateInfo sci{};
         sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        for (int k = 0; k < kMaxHotReloadGeneratedFrames && k < 4; ++k) {
+        for (int k = 0; k < kMaxHotReloadPresentOps && k < 4; ++k) {
             if (dd.createSemaphore(device, &sci, nullptr, &st.acquireSems[k]) != VK_SUCCESS ||
                 dd.createSemaphore(device, &sci, nullptr, &st.presentSems[k]) != VK_SUCCESS)
-                throw std::runtime_error("failed to create generated-frame semaphores");
+                throw std::runtime_error("failed to create output semaphores");
         }
 
         // Create FramegenContext only when generation is currently active.
@@ -966,6 +1266,9 @@ VKAPI_ATTR void VKAPI_CALL BionicFG_DestroySwapchainKHR(
         std::lock_guard<std::mutex> lk(g_mtx);
         auto dit = g_devices.find(dispatchKey(device));
         auto sit = g_swapchains.find(swapchain);
+#ifdef __ANDROID__
+        cancelScheduledPresents(swapchain);
+#endif
         if (dit != g_devices.end() && sit != g_swapchains.end())
             sit->second.cleanup(dit->second, sit->second.device);
         g_swapchains.erase(swapchain);
@@ -1036,6 +1339,116 @@ static VkResult acquireGeneratedImage(const DeviceData& dd, VkDevice device,
     return VK_ERROR_EXTENSION_NOT_PRESENT;
 }
 
+#ifdef __ANDROID__
+static VkResult presentSwapchainImage(const DeviceData& dd, VkQueue queue,
+                                      VkSwapchainKHR swapchain, uint32_t imageIndex,
+                                      const void* pNext = nullptr) {
+    VkPresentInfoKHR presentInfo{};
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.pNext = pNext;
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = &swapchain;
+    presentInfo.pImageIndices = &imageIndex;
+    return queuePresentLocked(dd, queue, &presentInfo);
+}
+
+static VkResult blitProducerToSwapchainAndWait(
+        const DeviceData& dd,
+        SwapState& st,
+        VkQueue queue,
+        const VkCommandBufferBeginInfo& cbi,
+        int slot,
+        ExtImage& src,
+        uint32_t dstImageIndex,
+        VkImageLayout dstOldLayout,
+        uint32_t waitSemaphoreCount = 0,
+        const VkSemaphore* waitSemaphores = nullptr,
+        VkFilter filter = VK_FILTER_LINEAR) {
+    if (slot < 0 || slot >= kMaxHotReloadPresentOps)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    if (dstImageIndex >= st.images.size())
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    if (!st.genCmds[slot] || !st.genFences[slot])
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkFence fence = st.genFences[slot];
+    VkResult waitRes = dd.waitForFences(st.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (waitRes != VK_SUCCESS) return waitRes;
+    VkResult resetRes = dd.resetFences(st.device, 1, &fence);
+    if (resetRes != VK_SUCCESS) return resetRes;
+
+    VkCommandBuffer cmd = st.genCmds[slot];
+    dd.resetCmdBuf(cmd, 0);
+    if (dd.beginCmdBuf(cmd, &cbi) != VK_SUCCESS)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    const VkImageLayout oldSrcLayout = src.layout;
+    const bool oldSrcExternalOwner = src.externalOwner;
+
+    uint32_t srcSrcFamily = src.externalOwner ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
+    uint32_t srcDstFamily = src.externalOwner ? st.copyQueueFamily : VK_QUEUE_FAMILY_IGNORED;
+    layerImageBarrier(dd, cmd, src.img,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        src.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        srcSrcFamily, srcDstFamily);
+    src.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    src.externalOwner = false;
+
+    layerImageBarrier(dd, cmd, st.images[dstImageIndex],
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        dstOldLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1]  = {(int32_t)st.extent.width, (int32_t)st.extent.height, 1};
+    blit.dstSubresource = blit.srcSubresource;
+    blit.dstOffsets[1]  = blit.srcOffsets[1];
+    dd.cmdBlitImage(cmd,
+        src.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        st.images[dstImageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &blit, filter);
+
+    layerImageBarrier(dd, cmd, src.img,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+        st.copyQueueFamily, VK_QUEUE_FAMILY_EXTERNAL);
+    src.layout = VK_IMAGE_LAYOUT_GENERAL;
+    src.externalOwner = true;
+
+    layerImageBarrier(dd, cmd, st.images[dstImageIndex],
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+    if (dd.endCmdBuf(cmd) != VK_SUCCESS) {
+        src.layout = oldSrcLayout;
+        src.externalOwner = oldSrcExternalOwner;
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    std::vector<VkPipelineStageFlags> waitStages(waitSemaphoreCount,
+                                                 VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.waitSemaphoreCount = waitSemaphoreCount;
+    si.pWaitSemaphores = waitSemaphores;
+    si.pWaitDstStageMask = waitStages.empty() ? nullptr : waitStages.data();
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    VkResult submitRes = queueSubmitLocked(dd, queue, 1, &si, fence);
+    if (submitRes != VK_SUCCESS) {
+        src.layout = oldSrcLayout;
+        src.externalOwner = oldSrcExternalOwner;
+        return submitRes;
+    }
+
+    return dd.waitForFences(st.device, 1, &fence, VK_TRUE, UINT64_MAX);
+}
+#endif
+
 // ─── QueuePresentKHR ──────────────────────────────────────────────────────────
 
 VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
@@ -1094,6 +1507,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
                     st.fgCtx->destroy();
                     st.fgCtx.reset();
                 }
+                resetFrameHistory(st);
                 st.conf = newConf;
                 BFG_LAYER("config hot-reloaded framegen=off flow=%.2f model=%d",
                           st.conf.flowScale, st.conf.model);
@@ -1148,16 +1562,159 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
     st.inPresent = true;
     struct Guard { SwapState& s; ~Guard(){ s.inPresent = false; } } guard{st};
 
+    const int64_t callbackStartNs = steadyNowNs();
+    const uint64_t sourceSeq = ++st.debugSourceSeq;
+    double srcDeltaMs = -1.0;
+    if (st.debugLastSourceStartNs != 0)
+        srcDeltaMs = nsToMs(callbackStartNs - st.debugLastSourceStartNs);
+    st.debugLastSourceStartNs = callbackStartNs;
+    const bool traceThisFrame = st.conf.debugTiming &&
+        (st.debugTraceFramesRemaining > 0 || (sourceSeq % 30ull) == 0ull);
+    if (traceThisFrame && st.debugTraceFramesRemaining > 0)
+        st.debugTraceFramesRemaining--;
+
+    std::ostringstream trace;
+    if (traceThisFrame) {
+        trace << std::fixed << std::setprecision(3)
+              << "timing src#" << sourceSeq
+              << " fc=" << st.frameCount
+              << " mult=" << st.conf.multiplier
+              << " model=" << st.conf.model
+              << " img=" << imgIdx;
+        if (srcDeltaMs >= 0.0)
+            trace << " srcDelta=" << srcDeltaMs << "ms";
+        if (st.conf.pacePresent)
+            trace << " pace=" << st.conf.paceIntervalMs << "ms";
+    }
+
+    auto finish = [&](VkResult res) -> VkResult {
+        const int64_t callbackNs = steadyNowNs() - callbackStartNs;
+        debugRecordCallbackTime(st, callbackNs);
+        if (traceThisFrame) {
+            trace << " cbTotal=" << nsToMs(callbackNs) << "ms"
+                  << " result=" << static_cast<int>(res);
+            BFG_LAYER("%s", trace.str().c_str());
+        }
+        return res;
+    };
+
     const uint32_t fi = static_cast<uint32_t>(st.frameCount & 1u);
     VkDevice device = st.device;
     const int N = std::min(st.conf.multiplier - 1, 4);
     bool consumedOriginalWaits = false;
+    VkCommandBufferBeginInfo cbi{};
+
+    int64_t pacedPresentBaseNs = 0;
+    const int64_t paceIntervalNs = static_cast<int64_t>(st.conf.paceIntervalMs * 1000000.0 + 0.5);
+
+    auto recordPresentTrace = [&](const char* label, int slot, uint32_t presentImage,
+                                  VkResult res, int64_t presentStartNs) {
+        const int64_t presentEndNs = steadyNowNs();
+        const double gapMs = debugRecordOutputPresent(st, presentEndNs);
+        if (traceThisFrame) {
+            trace << ' ' << label
+                  << "{slot=" << slot
+                  << ",img=" << presentImage
+                  << ",present=" << nsToMs(presentEndNs - presentStartNs) << "ms";
+            if (gapMs >= 0.0)
+                trace << ",gapPrev=" << gapMs << "ms";
+            trace << ",res=" << static_cast<int>(res) << '}';
+        }
+    };
+
+    auto presentInfoAndTrace = [&](const char* label, int slot, const VkPresentInfoKHR& info, uint32_t presentImage) -> VkResult {
+        const int64_t presentStartNs = steadyNowNs();
+        VkResult res = queuePresentLocked(dd, queue, &info);
+        recordPresentTrace(label, slot, presentImage, res, presentStartNs);
+        return res;
+    };
+
+    auto presentImageAndTrace = [&](const char* label, int slot, uint32_t presentImage, const void* pNext) -> VkResult {
+        const int64_t presentStartNs = steadyNowNs();
+        VkResult res = presentSwapchainImage(dd, queue, swapchain, presentImage, pNext);
+        recordPresentTrace(label, slot, presentImage, res, presentStartNs);
+        if (st.conf.pacePresent && slot == 0 && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR))
+            pacedPresentBaseNs = steadyNowNs();
+        return res;
+    };
+
+    auto scheduleImageAndTrace = [&](const char* label, int slot, uint32_t presentImage, const void* pNext = nullptr) {
+        if (!st.conf.pacePresent || slot <= 0 || pacedPresentBaseNs == 0 || paceIntervalNs <= 0) {
+            return presentImageAndTrace(label, slot, presentImage, pNext);
+        }
+        ScheduledPresent item{};
+        item.targetNs = pacedPresentBaseNs + static_cast<int64_t>(slot) * paceIntervalNs;
+        item.intervalNs = paceIntervalNs;
+        item.present = dd.queuePresent;
+        item.queue = queue;
+        item.swapchain = swapchain;
+        item.imageIndex = presentImage;
+        item.sourceSeq = sourceSeq;
+        item.slot = slot;
+        std::snprintf(item.label, sizeof(item.label), "%s", label);
+        schedulePresent(item);
+        if (traceThisFrame) {
+            trace << ' ' << label
+                  << "{slot=" << slot
+                  << ",img=" << presentImage
+                  << ",scheduled=+" << nsToMs(item.targetNs - pacedPresentBaseNs) << "ms}";
+        }
+        return VK_SUCCESS;
+    };
+
+    auto acquireAndTrace = [&](int slot, VkSemaphore semaphore, uint32_t* outImageIndex) -> VkResult {
+        const int64_t acquireStartNs = steadyNowNs();
+        VkResult res = acquireGeneratedImage(dd, device, swapchain, semaphore, outImageIndex);
+        const int64_t acquireNs = steadyNowNs() - acquireStartNs;
+        debugRecordAcquireWait(st, acquireNs);
+        if (traceThisFrame) {
+            trace << " slot" << slot << "Acq=" << nsToMs(acquireNs) << "ms";
+            if (outImageIndex && *outImageIndex != UINT32_MAX)
+                trace << "->" << *outImageIndex;
+            trace << "(" << static_cast<int>(res) << ')';
+        }
+        return res;
+    };
+
+    auto blitAndTrace = [&](const char* label, int slot, ExtImage& src, uint32_t dstImageIndex,
+                            VkImageLayout dstOldLayout, uint32_t waitSemaphoreCount,
+                            const VkSemaphore* waitSemaphores, VkFilter filter) -> VkResult {
+        const int64_t copyStartNs = steadyNowNs();
+        VkResult res = blitProducerToSwapchainAndWait(
+            dd, st, queue, cbi, slot, src, dstImageIndex,
+            dstOldLayout, waitSemaphoreCount, waitSemaphores, filter);
+        if (traceThisFrame) {
+            trace << ' ' << label
+                  << "Copy=" << nsToMs(steadyNowNs() - copyStartNs) << "ms"
+                  << "->" << dstImageIndex
+                  << "(" << static_cast<int>(res) << ')';
+        }
+        return res;
+    };
+
+    auto advanceFrameHistory = [&]() {
+        std::swap(st.prevAhb, st.currAhb);
+        std::swap(st.prevProducerImg, st.currProducerImg);
+        if (st.fgCtx) {
+            st.fgCtx->updateConfig(makeFramegenConfig(st, st.conf));
+        }
+        st.frameCount++;
+    };
+
+    VkResult overallResult = VK_SUCCESS;
+    auto noteResult = [&](VkResult res) {
+        if (res == VK_SUBOPTIMAL_KHR && overallResult == VK_SUCCESS) {
+            overallResult = VK_SUBOPTIMAL_KHR;
+        }
+    };
 
     if (!dd.resetCmdBuf || !dd.beginCmdBuf || !dd.endCmdBuf || !dd.queueSubmit || !dd.waitForFences ||
         !dd.resetFences || !dd.cmdBlitImage || !st.copyCmds[fi] || !st.copyFences[fi]) {
         BFG_LAYER_E("copy command infrastructure incomplete; passing through");
-        return callNextPresent(queue, pPresentInfo);
+        return finish(callNextPresent(queue, pPresentInfo));
     }
+
+    const int64_t inputCopyStartNs = steadyNowNs();
 
     // --- Step 1: Copy real swapchain image into current AHB input. The copy
     // waits on the application's original present semaphores, so the final real
@@ -1165,16 +1722,15 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
     if (dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, UINT64_MAX) != VK_SUCCESS ||
         dd.resetFences(device, 1, &st.copyFences[fi]) != VK_SUCCESS) {
         BFG_LAYER_E("copy fence wait/reset failed; passing through");
-        return callNextPresent(queue, pPresentInfo);
+        return finish(callNextPresent(queue, pPresentInfo));
     }
 
     dd.resetCmdBuf(st.copyCmds[fi], 0);
-    VkCommandBufferBeginInfo cbi{};
     cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (dd.beginCmdBuf(st.copyCmds[fi], &cbi) != VK_SUCCESS) {
         BFG_LAYER_E("begin copy command buffer failed; passing through");
-        return callNextPresent(queue, pPresentInfo);
+        return finish(callNextPresent(queue, pPresentInfo));
     }
 
     VkCommandBuffer cmd = st.copyCmds[fi];
@@ -1216,7 +1772,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
 
     if (dd.endCmdBuf(cmd) != VK_SUCCESS) {
         BFG_LAYER_E("end copy command buffer failed; passing through");
-        return callNextPresent(queue, pPresentInfo);
+        return finish(callNextPresent(queue, pPresentInfo));
     }
 
     std::vector<VkPipelineStageFlags> waitStages(pPresentInfo->waitSemaphoreCount,
@@ -1228,10 +1784,10 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
     si.pWaitDstStageMask = waitStages.empty() ? nullptr : waitStages.data();
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
-    VkResult submitRes = dd.queueSubmit(queue, 1, &si, st.copyFences[fi]);
+    VkResult submitRes = queueSubmitLocked(dd, queue, 1, &si, st.copyFences[fi]);
     if (submitRes != VK_SUCCESS) {
         BFG_LAYER_E("copy queue submit failed: %d; passing through", submitRes);
-        return callNextPresent(queue, pPresentInfo);
+        return finish(callNextPresent(queue, pPresentInfo));
     }
     consumedOriginalWaits = pPresentInfo->waitSemaphoreCount > 0;
 
@@ -1244,117 +1800,136 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
     VkResult copyWait = dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, UINT64_MAX);
     if (copyWait != VK_SUCCESS) {
         BFG_LAYER_E("copy fence wait failed after submit: %d", copyWait);
-        return dd.queuePresent(queue, &finalPresent);
+        return finish(presentInfoAndTrace("copywaitFallback", -1, finalPresent, imgIdx));
+    }
+    if (traceThisFrame)
+        trace << " inputCopy=" << nsToMs(steadyNowNs() - inputCopyStartNs) << "ms";
+
+    // Warmup frame: seed previous/current history, but still present the app's
+    // original image normally because no generated output exists yet.
+    if (st.frameCount == 0 || N <= 0) {
+        if (traceThisFrame) trace << " warmup";
+        advanceFrameHistory();
+        return finish(presentInfoAndTrace("warmupReal", -1, finalPresent, imgIdx));
     }
 
     // --- Step 2: Run framegen after we have both previous and current inputs.
-    if (st.frameCount > 0) {
-        st.fgCtx->present(st.prevAhb, st.currAhb);
-        st.fgCtx->waitIdle();
-        for (auto& out : st.outProducerImgs) {
-            out.layout = VK_IMAGE_LAYOUT_GENERAL;
-            out.externalOwner = true;
+    const int64_t fgStartNs = steadyNowNs();
+    st.fgCtx->present(st.prevAhb, st.currAhb);
+    st.fgCtx->waitIdle();
+    const int64_t fgNs = steadyNowNs() - fgStartNs;
+    debugRecordFramegenTime(st, fgNs);
+    if (traceThisFrame)
+        trace << " fg=" << nsToMs(fgNs) << "ms";
+    for (auto& out : st.outProducerImgs) {
+        out.layout = VK_IMAGE_LAYOUT_GENERAL;
+        out.externalOwner = true;
+    }
+
+    // --- Step 3: Use the app-owned present image for the first generated frame
+    // so the app's acquired image is still released this callback. Then acquire
+    // future swapchain images for the remaining generated frames and the copied
+    // current real frame, which lands on the last future slot.
+    VkResult firstCopy = blitAndTrace(
+        "gen0", 0, st.outProducerImgs[0], imgIdx,
+        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        0, nullptr, VK_FILTER_LINEAR);
+    if (firstCopy != VK_SUCCESS) {
+        BFG_LAYER_E("first generated frame copy failed: %d; presenting original real frame", firstCopy);
+        advanceFrameHistory();
+        return finish(presentInfoAndTrace("fallbackReal", -1, finalPresent, imgIdx));
+    }
+
+    VkResult firstPresent = presentImageAndTrace("gen0", 0, imgIdx, pPresentInfo->pNext);
+    noteResult(firstPresent);
+    if (firstPresent != VK_SUCCESS && firstPresent != VK_SUBOPTIMAL_KHR) {
+        BFG_LAYER_E("first generated frame present failed: %d", firstPresent);
+        advanceFrameHistory();
+        return finish(firstPresent);
+    }
+
+    for (int k = 1; k < N; ++k) {
+        if (!st.acquireSems[k] || !st.genCmds[k] || !st.genFences[k]) {
+            BFG_LAYER_E("generated frame slot %d is not provisioned", k);
+            advanceFrameHistory();
+            return finish(overallResult);
         }
 
-        // --- Step 3: Inject generated frames. Acquire/write/present are kept
-        // on distinct binary semaphores to avoid waiting and signaling the same
-        // semaphore in one submit.
-        for (int k = 0; k < N; ++k) {
-            if (!st.acquireSems[k] || !st.presentSems[k] || !st.genCmds[k] || !st.genFences[k])
-                continue;
+        uint32_t genIdx = UINT32_MAX;
+        VkResult acqRes = acquireAndTrace(k, st.acquireSems[k], &genIdx);
+        noteResult(acqRes);
+        if (acqRes != VK_SUCCESS && acqRes != VK_SUBOPTIMAL_KHR) {
+            BFG_LAYER_E("generated frame acquire failed at slot %d: %d", k, acqRes);
+            advanceFrameHistory();
+            return finish(overallResult);
+        }
+        if (genIdx >= st.images.size()) {
+            BFG_LAYER_E("generated image index %u out of range (%zu)", genIdx, st.images.size());
+            advanceFrameHistory();
+            return finish(overallResult);
+        }
 
-            uint32_t genIdx = UINT32_MAX;
-            VkResult acqRes = acquireGeneratedImage(dd, device, swapchain, st.acquireSems[k], &genIdx);
-            if (acqRes != VK_SUCCESS && acqRes != VK_SUBOPTIMAL_KHR) {
-                BFG_LAYER("generated frame acquire skipped: %d", acqRes);
-                continue;
-            }
-            if (genIdx >= st.images.size()) {
-                BFG_LAYER_E("generated image index %u out of range (%zu)", genIdx, st.images.size());
-                continue;
-            }
+        VkResult genCopy = blitAndTrace(
+            (std::string("gen") + std::to_string(k)).c_str(), k,
+            st.outProducerImgs[size_t(k)], genIdx,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            1, &st.acquireSems[k], VK_FILTER_LINEAR);
+        if (genCopy != VK_SUCCESS) {
+            BFG_LAYER_E("generated frame copy failed at slot %d: %d", k, genCopy);
+            advanceFrameHistory();
+            return finish(overallResult);
+        }
 
-            dd.waitForFences(device, 1, &st.genFences[k], VK_TRUE, UINT64_MAX);
-            dd.resetFences(device, 1, &st.genFences[k]);
-            VkCommandBuffer genCmd = st.genCmds[k];
-            dd.resetCmdBuf(genCmd, 0);
-            if (dd.beginCmdBuf(genCmd, &cbi) != VK_SUCCESS) {
-                BFG_LAYER_E("begin generated command buffer failed");
-                continue;
-            }
-
-            ExtImage& out = st.outProducerImgs[size_t(k)];
-            uint32_t outSrcFamily = out.externalOwner ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
-            uint32_t outDstFamily = out.externalOwner ? st.copyQueueFamily : VK_QUEUE_FAMILY_IGNORED;
-            layerImageBarrier(dd, genCmd, out.img,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                out.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                outSrcFamily, outDstFamily);
-            out.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            out.externalOwner = false;
-
-            layerImageBarrier(dd, genCmd, st.images[genIdx],
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-
-            dd.cmdBlitImage(genCmd,
-                out.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                st.images[genIdx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                1, &blit, VK_FILTER_LINEAR);
-
-            layerImageBarrier(dd, genCmd, out.img,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                st.copyQueueFamily, VK_QUEUE_FAMILY_EXTERNAL);
-            out.layout = VK_IMAGE_LAYOUT_GENERAL;
-            out.externalOwner = true;
-
-            layerImageBarrier(dd, genCmd, st.images[genIdx],
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-
-            if (dd.endCmdBuf(genCmd) != VK_SUCCESS) {
-                BFG_LAYER_E("end generated command buffer failed");
-                continue;
-            }
-
-            VkPipelineStageFlags waitMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
-            VkSubmitInfo gsi{};
-            gsi.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            gsi.waitSemaphoreCount   = 1;
-            gsi.pWaitSemaphores      = &st.acquireSems[k];
-            gsi.pWaitDstStageMask    = &waitMask;
-            gsi.commandBufferCount   = 1;
-            gsi.pCommandBuffers      = &genCmd;
-            gsi.signalSemaphoreCount = 1;
-            gsi.pSignalSemaphores    = &st.presentSems[k];
-            VkResult genSubmit = dd.queueSubmit(queue, 1, &gsi, st.genFences[k]);
-            if (genSubmit != VK_SUCCESS) {
-                BFG_LAYER_E("generated submit failed: %d", genSubmit);
-                continue;
-            }
-
-            VkPresentInfoKHR genPresent{};
-            genPresent.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-            genPresent.waitSemaphoreCount = 1;
-            genPresent.pWaitSemaphores    = &st.presentSems[k];
-            genPresent.swapchainCount     = 1;
-            genPresent.pSwapchains        = &swapchain;
-            genPresent.pImageIndices      = &genIdx;
-            dd.queuePresent(queue, &genPresent);
+        VkResult genPresent = scheduleImageAndTrace((std::string("gen") + std::to_string(k)).c_str(), k, genIdx);
+        noteResult(genPresent);
+        if (genPresent != VK_SUCCESS && genPresent != VK_SUBOPTIMAL_KHR) {
+            BFG_LAYER_E("generated frame present failed at slot %d: %d", k, genPresent);
+            advanceFrameHistory();
+            return finish(overallResult);
         }
     }
 
-    std::swap(st.prevAhb, st.currAhb);
-    std::swap(st.prevProducerImg, st.currProducerImg);
-    st.fgCtx->updateConfig(makeFramegenConfig(st, st.conf));
-    st.frameCount++;
+    const int realSlot = N;
+    if (!st.acquireSems[realSlot] || !st.genCmds[realSlot] || !st.genFences[realSlot]) {
+        BFG_LAYER_E("real frame slot %d is not provisioned", realSlot);
+        advanceFrameHistory();
+        return finish(overallResult);
+    }
 
-    return dd.queuePresent(queue, &finalPresent);
+    uint32_t realIdx = UINT32_MAX;
+    VkResult realAcq = acquireAndTrace(realSlot, st.acquireSems[realSlot], &realIdx);
+    noteResult(realAcq);
+    if (realAcq != VK_SUCCESS && realAcq != VK_SUBOPTIMAL_KHR) {
+        BFG_LAYER_E("real frame acquire failed at slot %d: %d", realSlot, realAcq);
+        advanceFrameHistory();
+        return finish(overallResult);
+    }
+    if (realIdx >= st.images.size()) {
+        BFG_LAYER_E("real frame image index %u out of range (%zu)", realIdx, st.images.size());
+        advanceFrameHistory();
+        return finish(overallResult);
+    }
+
+    VkResult realCopy = blitAndTrace(
+        "real", realSlot, st.currProducerImg, realIdx,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        1, &st.acquireSems[realSlot], VK_FILTER_NEAREST);
+    if (realCopy != VK_SUCCESS) {
+        BFG_LAYER_E("real frame copy failed at slot %d: %d", realSlot, realCopy);
+        advanceFrameHistory();
+        return finish(overallResult);
+    }
+
+    VkResult realPresent = scheduleImageAndTrace("real", realSlot, realIdx);
+    noteResult(realPresent);
+    if (realPresent != VK_SUCCESS && realPresent != VK_SUBOPTIMAL_KHR) {
+        BFG_LAYER_E("real frame present failed at slot %d: %d", realSlot, realPresent);
+        advanceFrameHistory();
+        return finish(overallResult);
+    }
+
+    advanceFrameHistory();
+    return finish(overallResult);
 #endif
 }
 
@@ -1367,6 +1942,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL BionicFG_GetDeviceProcAddr(
     HOOK(DestroyDevice);
     HOOK(GetDeviceQueue);
     HOOK(GetDeviceQueue2);
+    HOOK(QueueSubmit);
     HOOK(CreateSwapchainKHR);
     HOOK(DestroySwapchainKHR);
     HOOK(AcquireNextImage2KHR);
@@ -1388,6 +1964,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL BionicFG_GetInstanceProcAddr(
     HOOK(DestroyDevice);
     HOOK(GetDeviceQueue);
     HOOK(GetDeviceQueue2);
+    HOOK(QueueSubmit);
     HOOK(CreateSwapchainKHR);
     HOOK(DestroySwapchainKHR);
     HOOK(AcquireNextImage2KHR);
