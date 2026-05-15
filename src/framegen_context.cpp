@@ -839,10 +839,16 @@ void FramegenContext::present(AHardwareBuffer* newPrev, AHardwareBuffer* newCurr
     if (cfg_.model == 1) {
         // Runtime-confirmed steady-state Model-1 order:
         // 0x1a9ed4 -> 0x1afe28(no compute) -> 0x1b004c -> 0x1b0708
-        // -> 0x1b1b10(copy/barrier). We emit the 99 internal dispatches plus
-        // final shader_04 directly into the layer's generated AHB image.
+        // -> 0x1b1b10(copy/barrier). We emit the internal dispatch graph plus
+        // the active final shader_04 passes directly into the provisioned AHB
+        // outputs required by the current multiplier.
+        const size_t activeOutputs = std::min<size_t>(
+            outputImages_.size(),
+            cfg_.multiplier > 1 ? static_cast<size_t>(cfg_.multiplier - 1) : size_t{0});
+
         for (auto& img : model1Resources_) toStorage(cmd, img);
-        for (auto& out : outputImages_) {
+        for (size_t i = 0; i < activeOutputs; ++i) {
+            auto& out = outputImages_[i];
             if (out.external())
                 vk::acquireFromExternal(cmd, out, device_.computeFamily(), VK_ACCESS_SHADER_WRITE_BIT);
             toStorage(cmd, out);
@@ -855,7 +861,8 @@ void FramegenContext::present(AHardwareBuffer* newPrev, AHardwareBuffer* newCurr
             computeBarrier(cmd);
         }
 
-        for (auto& out : outputImages_) {
+        for (size_t i = 0; i < activeOutputs; ++i) {
+            auto& out = outputImages_[i];
             if (out.external())
                 vk::releaseToExternal(cmd, out, device_.computeFamily(), VK_ACCESS_SHADER_WRITE_BIT);
         }

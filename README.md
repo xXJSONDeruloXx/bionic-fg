@@ -35,10 +35,12 @@ For backwards compatibility, `BIONIC_FG_MULTIPLIER`, `BIONIC_FG_FLOW_SCALE`, and
 `BIONIC_FG_MODEL` are still accepted when the TOML file is missing. If the TOML
 file exists, it wins.
 
-The layer polls the config file timestamp during presentation. Flow-scale changes
-hot-reload in place. Changes to `enabled`, `multiplier`, or `model` return
-`VK_ERROR_OUT_OF_DATE_KHR` once so the application recreates its swapchain with
-the new frame-generation setup.
+The layer polls the config file timestamp during presentation.
+- `flow_scale` hot-reloads in place.
+- `multiplier` and `model` hot-reload by rebuilding the internal framegen
+  context against the already-provisioned AHB outputs and swapchain image pool.
+- `enabled` still returns `VK_ERROR_OUT_OF_DATE_KHR` once so the application
+  can recreate its swapchain with or without the layer active.
 
 Install layout expected by the manifest:
 

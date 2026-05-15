@@ -85,6 +85,11 @@ struct LayerConf {
     int64_t     configStamp = 0;
 };
 
+static constexpr int kMaxHotReloadMultiplier = 4;
+static constexpr int kMaxHotReloadGeneratedFrames = kMaxHotReloadMultiplier - 1;
+static constexpr uint32_t kHotReloadProvisionedSwapchainImages =
+    static_cast<uint32_t>(kMaxHotReloadMultiplier + 1);
+
 static std::string trim(std::string s) {
     auto notSpace = [](unsigned char ch) { return !std::isspace(ch); };
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
@@ -213,10 +218,28 @@ static LayerConf readConf() {
 }
 
 static bool configNeedsSwapchainRecreate(const LayerConf& oldConf, const LayerConf& newConf) {
-    return oldConf.enabled != newConf.enabled ||
-           oldConf.multiplier != newConf.multiplier ||
-           oldConf.model != newConf.model;
+    return oldConf.enabled != newConf.enabled;
 }
+
+#ifdef __ANDROID__
+struct DisableLayerEnvGuard {
+    bool hadDisable = false;
+    std::string oldDisable;
+
+    DisableLayerEnvGuard() {
+        if (const char* v = std::getenv("DISABLE_BIONIC_FG")) {
+            hadDisable = true;
+            oldDisable = v;
+        }
+        setenv("DISABLE_BIONIC_FG", "1", 1);
+    }
+
+    ~DisableLayerEnvGuard() {
+        if (hadDisable) setenv("DISABLE_BIONIC_FG", oldDisable.c_str(), 1);
+        else unsetenv("DISABLE_BIONIC_FG");
+    }
+};
+#endif
 
 // ─── Instance data ────────────────────────────────────────────────────────────
 
@@ -416,6 +439,55 @@ struct SwapState {
     }
 #endif
 };
+
+static bionic_fg::Config makeFramegenConfig(const SwapState& st, const LayerConf& conf) {
+    bionic_fg::Config cfg;
+    cfg.width = st.extent.width;
+    cfg.height = st.extent.height;
+    cfg.multiplier = static_cast<uint32_t>(std::max(2, std::min(kMaxHotReloadMultiplier, conf.multiplier)));
+    cfg.flowScale = conf.flowScale;
+    cfg.model = static_cast<uint32_t>(std::max(0, std::min(1, conf.model)));
+    return cfg;
+}
+
+#ifdef __ANDROID__
+static std::unique_ptr<bionic_fg::FramegenContext> createFramegenContext(
+        const SwapState& st,
+        const LayerConf& conf) {
+    DisableLayerEnvGuard disableLayerForInternalVulkan;
+    return bionic_fg::FramegenContext::create(
+        st.prevAhb,
+        st.currAhb,
+        st.outAhbs,
+        st.extent,
+        st.format,
+        makeFramegenConfig(st, conf));
+}
+
+static bool rebuildFramegenContext(SwapState& st, const LayerConf& conf) {
+    if (!st.prevAhb || !st.currAhb || st.outAhbs.empty()) {
+        BFG_LAYER_E("cannot rebuild FramegenContext: AHBs not provisioned");
+        return false;
+    }
+
+    if (st.fgCtx) st.fgCtx->waitIdle();
+
+    auto newCtx = createFramegenContext(st, conf);
+    if (!newCtx) {
+        BFG_LAYER_E("FramegenContext rebuild failed for mult=%d flow=%.2f model=%d",
+                    conf.multiplier, conf.flowScale, conf.model);
+        return false;
+    }
+
+    if (st.fgCtx) {
+        st.fgCtx->destroy();
+    }
+    st.fgCtx = std::move(newCtx);
+    BFG_LAYER("FramegenContext rebuilt: mult=%d flow=%.2f model=%d",
+              conf.multiplier, conf.flowScale, conf.model);
+    return true;
+}
+#endif
 
 // ─── Global state ─────────────────────────────────────────────────────────────
 
@@ -731,11 +803,12 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
         dd = it->second;
     }
 
-    // Modify swapchain: add transfer usage, request extra images for generated frames
+    // Modify swapchain: add transfer usage, request enough images up front for
+    // full 2x..4x hot-reload without requiring a swapchain recreation later.
     VkSwapchainCreateInfoKHR ci = *pCreateInfo;
     ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (conf.enabled)
-        ci.minImageCount = std::max(ci.minImageCount, static_cast<uint32_t>(conf.multiplier + 1));
+        ci.minImageCount = std::max(ci.minImageCount, kHotReloadProvisionedSwapchainImages);
 
     // Retire old swapchain state if recreating
     if (pCreateInfo->oldSwapchain) {
@@ -779,7 +852,8 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
 
     try {
         const uint32_t W = ci.imageExtent.width, H = ci.imageExtent.height;
-        const int N = conf.multiplier - 1;
+        const int requestedGeneratedFrames = conf.multiplier - 1;
+        const int provisionedGeneratedFrames = kMaxHotReloadGeneratedFrames;
 
         // Allocate AHBs
         auto allocAhb = [&](AHardwareBuffer** out) {
@@ -793,7 +867,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
         };
         allocAhb(&st.prevAhb);
         allocAhb(&st.currAhb);
-        for (int k = 0; k < N; ++k) {
+        for (int k = 0; k < provisionedGeneratedFrames; ++k) {
             AHardwareBuffer* o = nullptr; allocAhb(&o);
             st.outAhbs.push_back(o);
         }
@@ -809,7 +883,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
         st.currProducerImg = importAhb(dd, device, st.currAhb, {W,H}, VK_FORMAT_R8G8B8A8_UNORM, copyUsage);
         if (!st.prevProducerImg.img || !st.currProducerImg.img)
             throw std::runtime_error("failed to import input AHBs on producer device");
-        for (int k = 0; k < N; ++k) {
+        for (int k = 0; k < provisionedGeneratedFrames; ++k) {
             st.outProducerImgs.push_back(importAhb(dd, device, st.outAhbs[size_t(k)], {W,H}, VK_FORMAT_R8G8B8A8_UNORM, outUsage));
             if (!st.outProducerImgs.back().img)
                 throw std::runtime_error("failed to import output AHB on producer device");
@@ -830,7 +904,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
         cbai.commandBufferCount = 2;
         if (dd.allocCmdBufs(device, &cbai, st.copyCmds) != VK_SUCCESS)
             throw std::runtime_error("failed to allocate copy command buffers");
-        cbai.commandBufferCount = 4;
+        cbai.commandBufferCount = kMaxHotReloadGeneratedFrames;
         if (dd.allocCmdBufs(device, &cbai, st.genCmds) != VK_SUCCESS)
             throw std::runtime_error("failed to allocate generated-frame command buffers");
 
@@ -840,49 +914,29 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
         if (dd.createFence(device, &fci, nullptr, &st.copyFences[0]) != VK_SUCCESS ||
             dd.createFence(device, &fci, nullptr, &st.copyFences[1]) != VK_SUCCESS)
             throw std::runtime_error("failed to create copy fences");
-        for (int k = 0; k < N && k < 4; ++k) {
+        for (int k = 0; k < kMaxHotReloadGeneratedFrames && k < 4; ++k) {
             if (dd.createFence(device, &fci, nullptr, &st.genFences[k]) != VK_SUCCESS)
                 throw std::runtime_error("failed to create generated-frame fence");
         }
 
         VkSemaphoreCreateInfo sci{};
         sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        for (int k = 0; k < N && k < 4; ++k) {
+        for (int k = 0; k < kMaxHotReloadGeneratedFrames && k < 4; ++k) {
             if (dd.createSemaphore(device, &sci, nullptr, &st.acquireSems[k]) != VK_SUCCESS ||
                 dd.createSemaphore(device, &sci, nullptr, &st.presentSems[k]) != VK_SUCCESS)
                 throw std::runtime_error("failed to create generated-frame semaphores");
         }
 
-        // Create FramegenContext (uses its own device, imports AHBs). Avoid
-        // recursively loading this implicit layer into Bionic-FG's private
-        // Vulkan instance/device.
-        bionic_fg::Config cfg;
-        cfg.width      = W; cfg.height = H;
-        cfg.multiplier = static_cast<uint32_t>(conf.multiplier);
-        cfg.flowScale  = conf.flowScale;
-        cfg.model      = static_cast<uint32_t>(conf.model);
-        struct DisableLayerEnvGuard {
-            bool hadDisable = false;
-            std::string oldDisable;
-            DisableLayerEnvGuard() {
-                if (const char* v = std::getenv("DISABLE_BIONIC_FG")) {
-                    hadDisable = true;
-                    oldDisable = v;
-                }
-                setenv("DISABLE_BIONIC_FG", "1", 1);
-            }
-            ~DisableLayerEnvGuard() {
-                if (hadDisable) setenv("DISABLE_BIONIC_FG", oldDisable.c_str(), 1);
-                else unsetenv("DISABLE_BIONIC_FG");
-            }
-        } disableLayerForInternalVulkan;
-        st.fgCtx = bionic_fg::FramegenContext::create(
-            st.prevAhb, st.currAhb, st.outAhbs, {W,H}, VK_FORMAT_R8G8B8A8_UNORM, cfg);
+        // Create FramegenContext (uses its own device, imports the provisioned
+        // AHB set). We provision the maximum output count so multiplier/model
+        // changes can hot-reload without touching the app swapchain.
+        st.fgCtx = createFramegenContext(st, conf);
 
         if (!st.fgCtx) {
             BFG_LAYER_E("FramegenContext creation failed — layer will passthrough");
         } else {
-            BFG_LAYER("SwapchainState ready: %ux%u mult=%d shaders=embedded", W, H, N+1);
+            BFG_LAYER("SwapchainState ready: %ux%u mult=%d provisionedOutputs=%d shaders=embedded",
+                      W, H, requestedGeneratedFrames + 1, provisionedGeneratedFrames);
         }
     } catch (const std::exception& e) {
         BFG_LAYER_E("Exception in CreateSwapchainKHR setup — layer will passthrough: %s", e.what());
@@ -1010,18 +1064,39 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
     if (!st.conf.configPath.empty()) {
         int64_t currentStamp = fileStamp(st.conf.configPath);
         if (currentStamp != 0 && currentStamp != st.conf.configStamp) {
+            const LayerConf oldConf = st.conf;
             LayerConf newConf = readConf();
-            bool recreate = configNeedsSwapchainRecreate(st.conf, newConf);
-            st.conf = newConf;
-            if (recreate) {
+
+            if (configNeedsSwapchainRecreate(oldConf, newConf)) {
+                st.conf = newConf;
                 BFG_LAYER("config changed; requesting swapchain recreate enabled=%d mult=%d flow=%.2f model=%d",
                           st.conf.enabled ? 1 : 0, st.conf.multiplier, st.conf.flowScale, st.conf.model);
                 return VK_ERROR_OUT_OF_DATE_KHR;
             }
-            if (st.fgCtx) {
-                st.fgCtx->updateConfig(bionic_fg::Config{st.extent.width, st.extent.height,
-                    uint32_t(st.conf.multiplier), st.conf.flowScale, uint32_t(st.conf.model)});
-                BFG_LAYER("config hot-reloaded flow=%.2f", st.conf.flowScale);
+
+#ifdef __ANDROID__
+            const bool needsContextRebuild =
+                (oldConf.multiplier != newConf.multiplier) ||
+                (oldConf.model != newConf.model) ||
+                (!st.fgCtx && newConf.enabled);
+
+            if (needsContextRebuild) {
+                if (rebuildFramegenContext(st, newConf)) {
+                    st.conf = newConf;
+                    BFG_LAYER("config hot-reloaded mult=%d flow=%.2f model=%d via context rebuild",
+                              st.conf.multiplier, st.conf.flowScale, st.conf.model);
+                } else {
+                    BFG_LAYER_E("config rebuild failed; keeping old config enabled=%d mult=%d flow=%.2f model=%d",
+                                oldConf.enabled ? 1 : 0, oldConf.multiplier, oldConf.flowScale, oldConf.model);
+                }
+            } else
+#endif
+            {
+                st.conf = newConf;
+                if (st.fgCtx) {
+                    st.fgCtx->updateConfig(makeFramegenConfig(st, st.conf));
+                    BFG_LAYER("config hot-reloaded flow=%.2f", st.conf.flowScale);
+                }
             }
         }
     }
