@@ -693,6 +693,31 @@ static void schedulePresent(const ScheduledPresent& item) {
     g_presentSchedulerCv.notify_one();
 }
 
+static double predictSchedulerDelayMs(int64_t targetNs, int64_t intervalNs) {
+    if (intervalNs <= 0) return 0.0;
+    struct Candidate { int64_t targetNs; bool isNew; };
+    std::vector<Candidate> candidates;
+    {
+        std::lock_guard<std::mutex> lk(g_presentSchedulerMtx);
+        candidates.reserve(g_presentSchedulerQueue.size() + 1);
+        for (const auto& queued : g_presentSchedulerQueue)
+            candidates.push_back({queued.targetNs, false});
+        candidates.push_back({targetNs, true});
+        int64_t cursorNs = g_presentSchedulerLastPresentNs;
+        if (cursorNs == 0) cursorNs = targetNs - intervalNs;
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+            if (a.targetNs != b.targetNs) return a.targetNs < b.targetNs;
+            return !a.isNew && b.isNew;
+        });
+        for (const auto& candidate : candidates) {
+            cursorNs = std::max(candidate.targetNs, cursorNs + intervalNs);
+            if (candidate.isNew)
+                return nsToMs(cursorNs - targetNs);
+        }
+    }
+    return 0.0;
+}
+
 static void cancelScheduledPresents(VkSwapchainKHR swapchain) {
     std::lock_guard<std::mutex> lk(g_presentSchedulerMtx);
     for (auto it = g_presentSchedulerQueue.begin(); it != g_presentSchedulerQueue.end(); ) {
@@ -1848,7 +1873,17 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
         return finish(firstPresent);
     }
 
-    for (int k = 1; k < N; ++k) {
+    bool dropGeneratedFutures = false;
+    double futureLagMs = 0.0;
+    if (st.conf.pacePresent && N > 1 && pacedPresentBaseNs != 0 && paceIntervalNs > 0) {
+        futureLagMs = predictSchedulerDelayMs(pacedPresentBaseNs + paceIntervalNs, paceIntervalNs);
+        dropGeneratedFutures = futureLagMs > st.conf.paceIntervalMs;
+        if (traceThisFrame && dropGeneratedFutures)
+            trace << " dropGeneratedFutures{lag=" << futureLagMs << "ms}";
+    }
+
+    const int generatedEndSlot = dropGeneratedFutures ? 1 : N;
+    for (int k = 1; k < generatedEndSlot; ++k) {
         if (!st.acquireSems[k] || !st.genCmds[k] || !st.genFences[k]) {
             BFG_LAYER_E("generated frame slot %d is not provisioned", k);
             advanceFrameHistory();
@@ -1889,7 +1924,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
         }
     }
 
-    const int realSlot = N;
+    const int realSlot = dropGeneratedFutures ? 1 : N;
     if (!st.acquireSems[realSlot] || !st.genCmds[realSlot] || !st.genFences[realSlot]) {
         BFG_LAYER_E("real frame slot %d is not provisioned", realSlot);
         advanceFrameHistory();
