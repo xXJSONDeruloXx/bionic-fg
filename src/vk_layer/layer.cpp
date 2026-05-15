@@ -180,7 +180,7 @@ static void parseConfigFile(const std::string& path, LayerConf& c) {
                 c.enabled = parseBool(value, c.enabled);
                 sawEnabled = true;
             } else if (key == "multiplier") {
-                c.multiplier = std::max(2, std::min(4, std::atoi(unquote(value).c_str())));
+                c.multiplier = std::max(0, std::min(4, std::atoi(unquote(value).c_str())));
             } else if (key == "flow_scale" || key == "flowscale") {
                 c.flowScale = std::max(0.2f, std::min(1.0f, static_cast<float>(std::atof(unquote(value).c_str()))));
             } else if (key == "model") {
@@ -203,7 +203,7 @@ static LayerConf readConf() {
 
     // Backwards-compatible env fallback. A config file, when present, wins.
     if (auto* v = std::getenv("BIONIC_FG_MULTIPLIER"))
-        c.multiplier = std::max(2, std::min(4, std::atoi(v)));
+        c.multiplier = std::max(0, std::min(4, std::atoi(v)));
     if (auto* v = std::getenv("BIONIC_FG_FLOW_SCALE"))
         c.flowScale = std::max(0.2f, std::min(1.0f, static_cast<float>(std::atof(v))));
     if (auto* v = std::getenv("BIONIC_FG_MODEL"))
@@ -852,7 +852,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
 
     try {
         const uint32_t W = ci.imageExtent.width, H = ci.imageExtent.height;
-        const int requestedGeneratedFrames = conf.multiplier - 1;
+        const int requestedGeneratedFrames = std::max(conf.multiplier - 1, 0);
         const int provisionedGeneratedFrames = kMaxHotReloadGeneratedFrames;
 
         // Allocate AHBs
@@ -927,16 +927,20 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
                 throw std::runtime_error("failed to create generated-frame semaphores");
         }
 
-        // Create FramegenContext (uses its own device, imports the provisioned
-        // AHB set). We provision the maximum output count so multiplier/model
-        // changes can hot-reload without touching the app swapchain.
-        st.fgCtx = createFramegenContext(st, conf);
-
-        if (!st.fgCtx) {
-            BFG_LAYER_E("FramegenContext creation failed — layer will passthrough");
+        // Create FramegenContext only when generation is currently active.
+        // The swapchain/AHB set is still provisioned for full 2x..4x hot-reload,
+        // so turning framegen on later does not require app-side swapchain rebuilds.
+        if (requestedGeneratedFrames > 0) {
+            st.fgCtx = createFramegenContext(st, conf);
+            if (!st.fgCtx) {
+                BFG_LAYER_E("FramegenContext creation failed — layer will passthrough");
+            } else {
+                BFG_LAYER("SwapchainState ready: %ux%u mult=%d provisionedOutputs=%d shaders=embedded",
+                          W, H, requestedGeneratedFrames + 1, provisionedGeneratedFrames);
+            }
         } else {
-            BFG_LAYER("SwapchainState ready: %ux%u mult=%d provisionedOutputs=%d shaders=embedded",
-                      W, H, requestedGeneratedFrames + 1, provisionedGeneratedFrames);
+            BFG_LAYER("SwapchainState provisioned: %ux%u framegen=off provisionedOutputs=%d",
+                      W, H, provisionedGeneratedFrames);
         }
     } catch (const std::exception& e) {
         BFG_LAYER_E("Exception in CreateSwapchainKHR setup — layer will passthrough: %s", e.what());
@@ -1075,29 +1079,46 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
             }
 
 #ifdef __ANDROID__
-            const bool needsContextRebuild =
-                (oldConf.multiplier != newConf.multiplier) ||
-                (oldConf.model != newConf.model) ||
-                (!st.fgCtx && newConf.enabled);
+            const bool oldActive = oldConf.multiplier >= 2;
+            const bool newActive = newConf.multiplier >= 2;
 
-            if (needsContextRebuild) {
-                if (rebuildFramegenContext(st, newConf)) {
-                    st.conf = newConf;
-                    BFG_LAYER("config hot-reloaded mult=%d flow=%.2f model=%d via context rebuild",
-                              st.conf.multiplier, st.conf.flowScale, st.conf.model);
-                } else {
-                    BFG_LAYER_E("config rebuild failed; keeping old config enabled=%d mult=%d flow=%.2f model=%d",
-                                oldConf.enabled ? 1 : 0, oldConf.multiplier, oldConf.flowScale, oldConf.model);
-                }
-            } else
-#endif
-            {
-                st.conf = newConf;
+            if (!newActive) {
                 if (st.fgCtx) {
-                    st.fgCtx->updateConfig(makeFramegenConfig(st, st.conf));
-                    BFG_LAYER("config hot-reloaded flow=%.2f", st.conf.flowScale);
+                    st.fgCtx->destroy();
+                    st.fgCtx.reset();
+                }
+                st.conf = newConf;
+                BFG_LAYER("config hot-reloaded framegen=off flow=%.2f model=%d",
+                          st.conf.flowScale, st.conf.model);
+            } else {
+                const bool needsContextRebuild =
+                    !oldActive ||
+                    !st.fgCtx ||
+                    (oldConf.multiplier != newConf.multiplier) ||
+                    (oldConf.model != newConf.model);
+
+                if (needsContextRebuild) {
+                    if (rebuildFramegenContext(st, newConf)) {
+                        st.conf = newConf;
+                        BFG_LAYER("config hot-reloaded mult=%d flow=%.2f model=%d via context rebuild",
+                                  st.conf.multiplier, st.conf.flowScale, st.conf.model);
+                    } else {
+                        BFG_LAYER_E("config rebuild failed; keeping old config enabled=%d mult=%d flow=%.2f model=%d",
+                                    oldConf.enabled ? 1 : 0, oldConf.multiplier, oldConf.flowScale, oldConf.model);
+                    }
+                } else {
+                    st.conf = newConf;
+                    if (st.fgCtx) {
+                        st.fgCtx->updateConfig(makeFramegenConfig(st, st.conf));
+                        BFG_LAYER("config hot-reloaded flow=%.2f", st.conf.flowScale);
+                    }
                 }
             }
+#else
+            {
+                st.conf = newConf;
+            }
+#endif
         }
     }
 
@@ -1323,8 +1344,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
 
     std::swap(st.prevAhb, st.currAhb);
     std::swap(st.prevProducerImg, st.currProducerImg);
-    st.fgCtx->updateConfig(bionic_fg::Config{st.extent.width, st.extent.height,
-        uint32_t(st.conf.multiplier), st.conf.flowScale, uint32_t(st.conf.model)});
+    st.fgCtx->updateConfig(makeFramegenConfig(st, st.conf));
     st.frameCount++;
 
     return dd.queuePresent(queue, &finalPresent);

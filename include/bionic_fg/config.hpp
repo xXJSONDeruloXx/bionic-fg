@@ -12,7 +12,7 @@ struct Config {
     uint32_t model = 0;
 
     void sanitize() {
-        if (multiplier < 2) multiplier = 2;
+        if (multiplier < 2) multiplier = 0;
         if (multiplier > 4) multiplier = 4;
         if (flowScale < 0.2f) flowScale = 0.2f;
         if (flowScale > 1.0f) flowScale = 1.0f;

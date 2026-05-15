@@ -26,7 +26,7 @@ version = 1
 
 [global]
 enabled = true
-multiplier = 2   # 2..4
+multiplier = 2   # 0=off, or 2..4
 flow_scale = 0.8 # 0.2..1.0
 model = 0        # 0 or 1
 ```
@@ -39,6 +39,8 @@ The layer polls the config file timestamp during presentation.
 - `flow_scale` hot-reloads in place.
 - `multiplier` and `model` hot-reload by rebuilding the internal framegen
   context against the already-provisioned AHB outputs and swapchain image pool.
+  Setting `multiplier = 0` turns frame generation off without recreating the
+  app swapchain.
 - `enabled` still returns `VK_ERROR_OUT_OF_DATE_KHR` once so the application
   can recreate its swapchain with or without the layer active.
 
