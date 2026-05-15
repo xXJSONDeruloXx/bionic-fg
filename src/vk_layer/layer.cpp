@@ -1013,14 +1013,21 @@ static VkResult callNextPresent(VkQueue queue, const VkPresentInfoKHR* presentIn
 static VkResult acquireGeneratedImage(const DeviceData& dd, VkDevice device,
                                       VkSwapchainKHR swapchain, VkSemaphore signalSemaphore,
                                       uint32_t* imageIndex) {
+    // Pace generated presents by blocking until the presentation engine releases
+    // the next FIFO slot/image instead of best-effort grabbing whatever is
+    // immediately available. This mirrors lsfg-vk's Android path and avoids the
+    // bursty "present everything right now or skip it" behavior from timeout=0.
+    constexpr uint64_t kAcquireTimeoutNs = UINT64_MAX;
+
     if (dd.acquireNextImage) {
-        return dd.acquireNextImage(device, swapchain, 0, signalSemaphore, VK_NULL_HANDLE, imageIndex);
+        return dd.acquireNextImage(device, swapchain, kAcquireTimeoutNs,
+                                   signalSemaphore, VK_NULL_HANDLE, imageIndex);
     }
     if (dd.acquireNextImage2) {
         VkAcquireNextImageInfoKHR info{};
         info.sType      = VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR;
         info.swapchain  = swapchain;
-        info.timeout    = 0;
+        info.timeout    = kAcquireTimeoutNs;
         info.semaphore  = signalSemaphore;
         info.fence      = VK_NULL_HANDLE;
         info.deviceMask = 1;
