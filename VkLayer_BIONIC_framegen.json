@@ -13,6 +13,9 @@
         },
         "enable_environment": {
             "BIONIC_FG_ENABLE": "1"
+        },
+        "disable_environment": {
+            "BIONIC_FG_DISABLE": "1"
         }
     }
 }
