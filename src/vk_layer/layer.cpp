@@ -1092,11 +1092,51 @@ static VkResult acquireGeneratedImage(const DeviceData& dd, VkDevice device,
 // separate host driver (e.g. Winlator/Bannerlator's wrapper_icd -> Turnip via
 // adrenotools) the host queue/semaphore model differs and that fence never
 // signals, hanging the present thread forever (-> ANR/SIGQUIT; observed as a
-// 36s freeze on first interpolated frame). A bounded wait degrades to a normal
-// real-frame present instead of hanging, and after a few timeouts we disable
-// framegen for this swapchain entirely so the app runs at full speed.
-static constexpr uint64_t kFenceTimeoutNs   = 250000000ull; // 250 ms
-static constexpr uint32_t kMaxFenceTimeouts = 2;
+// 36s freeze on first interpolated frame). Every wait is bounded so the present
+// ALWAYS returns and degrades to a normal real-frame present instead of hanging
+// — that alone is what prevents the ANR, no matter how many frames time out.
+//
+// Two distinct concerns, deliberately kept separate:
+//  1. Sync incompatibility — the fence *never* signals. Detected by a GENEROUS
+//     timeout on the copy fences so a merely-slow frame (shader compilation,
+//     queue backlog) is not misclassified; after enough CONSECUTIVE timeouts we
+//     disable framegen for the swapchain to stop wasting time on a hopelessly
+//     broken path. The timeout scales off the frame budget when a base fps limit
+//     is set, else a fixed fallback.
+//  2. Generated-frame cadence — a generated frame is merely late. When a base
+//     fps limit is set, generated frames get a SHORTER deadline derived from the
+//     target output-frame interval; a late one is simply skipped to hold pace and
+//     is NOT counted as a sync failure.
+static constexpr uint64_t kSyncFenceTimeoutNoLimitNs = 500000000ull; // 500ms when no fps limit
+static constexpr uint64_t kSyncFenceTimeoutMinNs     = 200000000ull; // 200ms floor
+static constexpr uint64_t kSyncFenceTimeoutMaxNs     = 1000000000ull;// 1s cap
+static constexpr uint32_t kMaxFenceTimeouts          = 6;  // consecutive before disabling framegen
+
+// Generous "is the sync path stuck?" bound: ~4 base-frame intervals when an fps
+// limit is set (clamped), else a fixed fallback.
+static uint64_t syncFenceTimeoutNs(const LayerConf& c) {
+    if (c.fpsLimit <= 0) return kSyncFenceTimeoutNoLimitNs;
+    uint64_t budget = 1000000000ull / (uint64_t)c.fpsLimit;   // one base-frame interval
+    uint64_t t = budget * 4;
+    if (t < kSyncFenceTimeoutMinNs) t = kSyncFenceTimeoutMinNs;
+    if (t > kSyncFenceTimeoutMaxNs) t = kSyncFenceTimeoutMaxNs;
+    return t;
+}
+
+// Shorter per-generated-frame "keep cadence" deadline: ~2x the target output
+// interval (1s / (base_fps * multiplier)). Returns 0 when no fps limit is set,
+// meaning "no cadence deadline — fall back to the sync bound". Never exceeds the
+// sync timeout.
+static uint64_t genFrameDeadlineNs(const LayerConf& c) {
+    if (c.fpsLimit <= 0) return 0;
+    uint64_t mult = (uint64_t)std::max(1, c.multiplier);
+    uint64_t outInterval = 1000000000ull / ((uint64_t)c.fpsLimit * mult);
+    uint64_t d = outInterval * 2;
+    if (d < 1000000ull) d = 1000000ull;                       // 1ms floor
+    uint64_t cap = syncFenceTimeoutNs(c);
+    if (d > cap) d = cap;
+    return d;
+}
 
 // Increment the given per-type timeout counter and disable framegen for the
 // swapchain once it reaches the threshold. Counters are independent so a
@@ -1253,7 +1293,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
     // --- Step 1: Copy real swapchain image into current AHB input. The copy
     // waits on the application's original present semaphores, so the final real
     // present must not wait on those same binary semaphores again.
-    VkResult copyPreWait = dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, kFenceTimeoutNs);
+    VkResult copyPreWait = dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, syncFenceTimeoutNs(st.conf));
     if (copyPreWait == VK_TIMEOUT) {
         BFG_LAYER_E("copy fence (pre-submit) wait timed out; passing through");
         noteFenceTimeout(st, st.copyFenceTimeouts, "copy");
@@ -1337,7 +1377,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
         finalPresent.pWaitSemaphores = nullptr;
     }
 
-    VkResult copyWait = dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, kFenceTimeoutNs);
+    VkResult copyWait = dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, syncFenceTimeoutNs(st.conf));
     if (copyWait != VK_SUCCESS) {
         if (copyWait == VK_TIMEOUT) {
             BFG_LAYER_E("copy fence (post-submit) wait timed out; presenting real frame only");
@@ -1377,9 +1417,22 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
                 continue;
             }
 
-            if (dd.waitForFences(device, 1, &st.genFences[k], VK_TRUE, kFenceTimeoutNs) != VK_SUCCESS) {
-                BFG_LAYER_E("generated-frame fence wait timed out; skipping injected frame %d", k);
-                noteFenceTimeout(st, st.genFenceTimeouts, "generated-frame");
+            // Cadence deadline (if an fps limit is set) is shorter than the sync
+            // bound. Missing the cadence deadline = "late, skip to hold pace" and is
+            // NOT a sync failure; only a timeout at the full sync bound counts toward
+            // disabling framegen.
+            const uint64_t genSyncBound = syncFenceTimeoutNs(st.conf);
+            const uint64_t genDeadline  = genFrameDeadlineNs(st.conf);
+            const uint64_t genWait      = (genDeadline > 0) ? genDeadline : genSyncBound;
+            if (dd.waitForFences(device, 1, &st.genFences[k], VK_TRUE, genWait) != VK_SUCCESS) {
+                if (genDeadline > 0 && genDeadline < genSyncBound) {
+                    BFG_LAYER("generated-frame %d missed %ums cadence deadline; skipping to hold pace",
+                              k, (unsigned)(genWait / 1000000ull));
+                } else {
+                    BFG_LAYER_E("generated-frame fence wait timed out at sync bound (%ums); skipping injected frame %d",
+                                (unsigned)(genWait / 1000000ull), k);
+                    noteFenceTimeout(st, st.genFenceTimeouts, "generated-frame");
+                }
                 continue;
             }
             st.genFenceTimeouts = 0;   // a generated-frame fence signalled; sync working
