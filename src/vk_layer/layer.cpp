@@ -448,7 +448,12 @@ struct SwapState {
 
     uint64_t frameCount = 0;
     bool     inPresent  = false;
-    uint32_t fenceTimeouts = 0;   // consecutive cross-context fence timeouts; disables framegen past a threshold
+    // Consecutive cross-context fence timeouts, tracked PER fence type so a
+    // working copy path can't mask a stuck generated-frame path (or vice versa).
+    // Each is reset only when a fence of that same type signals; framegen is
+    // disabled once either reaches kMaxFenceTimeouts.
+    uint32_t copyFenceTimeouts = 0;
+    uint32_t genFenceTimeouts  = 0;
     int64_t  lastPresentNs = 0;   // for the fps_limit base-frame pacer (CLOCK_MONOTONIC)
 
     void cleanup(const DeviceData& dd, VkDevice dev) {
@@ -1093,12 +1098,15 @@ static VkResult acquireGeneratedImage(const DeviceData& dd, VkDevice device,
 static constexpr uint64_t kFenceTimeoutNs   = 250000000ull; // 250 ms
 static constexpr uint32_t kMaxFenceTimeouts = 2;
 
-static void noteFenceTimeout(SwapState& st) {
-    if (++st.fenceTimeouts >= kMaxFenceTimeouts && st.conf.enabled) {
+// Increment the given per-type timeout counter and disable framegen for the
+// swapchain once it reaches the threshold. Counters are independent so a
+// healthy copy path can't reset a stuck generated-frame path.
+static void noteFenceTimeout(SwapState& st, uint32_t& counter, const char* which) {
+    if (++counter >= kMaxFenceTimeouts && st.conf.enabled) {
         st.conf.enabled = false;
-        BFG_LAYER_E("disabling framegen for this swapchain after %u fence timeouts "
-                    "(present-path sync incompatible with this ICD); real frames only",
-                    st.fenceTimeouts);
+        BFG_LAYER_E("disabling framegen for this swapchain after %u consecutive %s fence "
+                    "timeouts (present-path sync incompatible with this ICD); real frames only",
+                    counter, which);
     }
 }
 
@@ -1248,7 +1256,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
     VkResult copyPreWait = dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, kFenceTimeoutNs);
     if (copyPreWait == VK_TIMEOUT) {
         BFG_LAYER_E("copy fence (pre-submit) wait timed out; passing through");
-        noteFenceTimeout(st);
+        noteFenceTimeout(st, st.copyFenceTimeouts, "copy");
         return callNextPresent(queue, pPresentInfo);
     }
     if (copyPreWait != VK_SUCCESS || dd.resetFences(device, 1, &st.copyFences[fi]) != VK_SUCCESS) {
@@ -1333,13 +1341,14 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
     if (copyWait != VK_SUCCESS) {
         if (copyWait == VK_TIMEOUT) {
             BFG_LAYER_E("copy fence (post-submit) wait timed out; presenting real frame only");
-            noteFenceTimeout(st);
+            noteFenceTimeout(st, st.copyFenceTimeouts, "copy");
         } else {
             BFG_LAYER_E("copy fence wait failed after submit: %d", copyWait);
         }
         return dd.queuePresent(queue, &finalPresent);
     }
-    st.fenceTimeouts = 0;   // cross-context sync is working this frame
+    st.copyFenceTimeouts = 0;   // copy path signalled this frame; reset ONLY the copy counter
+                                // (generated-frame counter is reset on its own success below)
 
     // --- Step 2: Run framegen after we have both previous and current inputs.
     if (st.frameCount > 0) {
@@ -1370,9 +1379,10 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
 
             if (dd.waitForFences(device, 1, &st.genFences[k], VK_TRUE, kFenceTimeoutNs) != VK_SUCCESS) {
                 BFG_LAYER_E("generated-frame fence wait timed out; skipping injected frame %d", k);
-                noteFenceTimeout(st);
+                noteFenceTimeout(st, st.genFenceTimeouts, "generated-frame");
                 continue;
             }
+            st.genFenceTimeouts = 0;   // a generated-frame fence signalled; sync working
             dd.resetFences(device, 1, &st.genFences[k]);
             VkCommandBuffer genCmd = st.genCmds[k];
             dd.resetCmdBuf(genCmd, 0);
