@@ -36,14 +36,25 @@ public:
     // Creates a standalone Vulkan device on the first capable physical device.
     // On Android, requests the AHB extension chain automatically.
     static Device create();
-    // Wrap an existing device (owned=false: destroy() does nothing)
+    // Wrap an existing device (owned=false: destroy() does nothing).
+    // `memPropsFn` should be the next-layer dispatch for
+    // vkGetPhysicalDeviceMemoryProperties (obtained via the layer's
+    // nextGetInstanceProcAddr): calling the global loader symbol from inside a
+    // layer with a chain-level physical-device handle can crash. Pass nullptr
+    // (e.g. the standalone path) to fall back to the global symbol.
     static Device wrap(VkInstance inst, VkPhysicalDevice phys, VkDevice dev,
-                       uint32_t computeFamily, VkQueue queue);
+                       uint32_t computeFamily, VkQueue queue,
+                       PFN_vkGetPhysicalDeviceMemoryProperties memPropsFn = nullptr);
 
     VkDevice handle()           const { return device_; }
     VkPhysicalDevice physical() const { return physical_; }
     uint32_t computeFamily()    const { return computeFamily_; }
     VkQueue  computeQueue()     const { return computeQueue_; }
+    // Physical-device memory-properties query routed through the layer dispatch
+    // when wrapped; falls back to the global symbol otherwise.
+    PFN_vkGetPhysicalDeviceMemoryProperties memPropsFn() const {
+        return memPropsFn_ ? memPropsFn_ : &vkGetPhysicalDeviceMemoryProperties;
+    }
     bool valid() const { return device_ != VK_NULL_HANDLE; }
 
     void destroy();
@@ -55,6 +66,7 @@ private:
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     uint32_t     computeFamily_= 0;
     VkQueue      computeQueue_ = VK_NULL_HANDLE;
+    PFN_vkGetPhysicalDeviceMemoryProperties memPropsFn_ = nullptr;
 };
 
 // ─── Image ───────────────────────────────────────────────────────────────────
@@ -266,7 +278,7 @@ void releaseToExternal(VkCommandBuffer cmd, const Image& img,
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
-uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeBits,
+uint32_t findMemoryType(const Device& dev, uint32_t typeBits,
                         VkMemoryPropertyFlags props);
 
 } // namespace bionic_fg::vk

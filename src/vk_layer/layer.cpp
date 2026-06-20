@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
+#include <time.h>
 #include <unordered_map>
 #include <vector>
 
@@ -81,6 +83,8 @@ struct LayerConf {
     int         multiplier = 2;
     float       flowScale  = 0.6f;
     int         model      = 0;
+    int         fpsLimit   = 0;     // base real-frame cap (0 = off, else 10-200). Paces real
+                                    // frames BEFORE interpolation, so on-screen fps = limit × multiplier.
     std::string configPath;
     int64_t     configStamp = 0;
 };
@@ -148,6 +152,23 @@ static int64_t fileStamp(const std::string& path) {
 #endif
 }
 
+static int64_t nowNs() {
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+}
+
+// Sleep until `targetNs` (CLOCK_MONOTONIC). nanosleep is relative, so compute the delta.
+static void sleepUntilNs(int64_t targetNs) {
+    int64_t delta = targetNs - nowNs();
+    if (delta <= 0) return;
+    struct timespec req;
+    req.tv_sec  = static_cast<time_t>(delta / 1000000000LL);
+    req.tv_nsec = static_cast<long>(delta % 1000000000LL);
+    // Loop to absorb EINTR.
+    while (nanosleep(&req, &req) == -1 && errno == EINTR) {}
+}
+
 static std::string defaultConfigPath() {
     if (const char* explicitPath = std::getenv("BIONIC_FG_CONFIG")) {
         if (explicitPath[0] != '\0') return explicitPath;
@@ -185,6 +206,9 @@ static void parseConfigFile(const std::string& path, LayerConf& c) {
                 c.flowScale = std::max(0.2f, std::min(1.0f, static_cast<float>(std::atof(unquote(value).c_str()))));
             } else if (key == "model") {
                 c.model = std::max(0, std::min(1, std::atoi(unquote(value).c_str())));
+            } else if (key == "fps_limit" || key == "fpslimit") {
+                int v = std::atoi(unquote(value).c_str());
+                c.fpsLimit = (v <= 0) ? 0 : std::max(10, std::min(200, v));
             }
         } catch (...) {
             BFG_LAYER_E("Ignoring invalid config value: %s", line.c_str());
@@ -208,6 +232,10 @@ static LayerConf readConf() {
         c.flowScale = std::max(0.2f, std::min(1.0f, static_cast<float>(std::atof(v))));
     if (auto* v = std::getenv("BIONIC_FG_MODEL"))
         c.model = std::max(0, std::min(1, std::atoi(v)));
+    if (auto* v = std::getenv("BIONIC_FG_FPS_LIMIT")) {
+        int iv = std::atoi(v);
+        c.fpsLimit = (iv <= 0) ? 0 : std::max(10, std::min(200, iv));
+    }
 
     c.configPath = defaultConfigPath();
     if (!c.configPath.empty()) {
@@ -388,6 +416,11 @@ static void freeExtImage(const DeviceData& dd, VkDevice device, ExtImage& img) {
 
 struct SwapState {
     VkDevice   device = VK_NULL_HANDLE;
+    // App-device handles for single-device framegen (wrapped, not owned).
+    VkInstance       instance     = VK_NULL_HANDLE;
+    VkPhysicalDevice physical     = VK_NULL_HANDLE;
+    VkQueue          computeQueue = VK_NULL_HANDLE;
+    PFN_vkGetPhysicalDeviceMemoryProperties getPhysMemProps = nullptr; // next-layer instance dispatch
     VkExtent2D extent = {};
     VkFormat   format = VK_FORMAT_UNDEFINED;
     std::vector<VkImage> images;
@@ -415,6 +448,8 @@ struct SwapState {
 
     uint64_t frameCount = 0;
     bool     inPresent  = false;
+    uint32_t fenceTimeouts = 0;   // consecutive cross-context fence timeouts; disables framegen past a threshold
+    int64_t  lastPresentNs = 0;   // for the fps_limit base-frame pacer (CLOCK_MONOTONIC)
 
     void cleanup(const DeviceData& dd, VkDevice dev) {
         if (dd.deviceWaitIdle) dd.deviceWaitIdle(dev);
@@ -455,7 +490,13 @@ static std::unique_ptr<bionic_fg::FramegenContext> createFramegenContext(
         const SwapState& st,
         const LayerConf& conf) {
     DisableLayerEnvGuard disableLayerForInternalVulkan;
+    // Wrap the application's own device (not owned) so interpolation runs on the
+    // same device as the swapchain/AHBs — single-device mode.
+    bionic_fg::vk::Device appDevice = bionic_fg::vk::Device::wrap(
+        st.instance, st.physical, st.device, st.copyQueueFamily, st.computeQueue,
+        st.getPhysMemProps);
     return bionic_fg::FramegenContext::create(
+        appDevice,
         st.prevAhb,
         st.currAhb,
         st.outAhbs,
@@ -897,6 +938,15 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_CreateSwapchainKHR(
         cpci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         dd.createCmdPool(device, &cpci, nullptr, &st.copyPool);
 
+        // App-device handles for single-device framegen. Reuse the same queue the
+        // copy path submits to (the present/graphics queue) so all framegen work
+        // is ordered on one queue from the present thread.
+        st.instance = dd.instance;
+        st.physical = dd.physical;
+        st.getPhysMemProps = dd.getPhysDevMemProps; // route phys-dev queries via layer dispatch
+        if (dd.getDeviceQueue)
+            dd.getDeviceQueue(device, dd.queueFamilyIdx, 0, &st.computeQueue);
+
         VkCommandBufferAllocateInfo cbai{};
         cbai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cbai.commandPool        = st.copyPool;
@@ -1031,6 +1081,27 @@ static VkResult acquireGeneratedImage(const DeviceData& dd, VkDevice device,
 
 // ─── QueuePresentKHR ──────────────────────────────────────────────────────────
 
+// Bound the cross-context fence waits in the present path. The copy command
+// buffer is submitted waiting on the application's *own* present semaphores
+// (DXVK's, here), then we wait on its fence. On some ICDs that bridge to a
+// separate host driver (e.g. Winlator/Bannerlator's wrapper_icd -> Turnip via
+// adrenotools) the host queue/semaphore model differs and that fence never
+// signals, hanging the present thread forever (-> ANR/SIGQUIT; observed as a
+// 36s freeze on first interpolated frame). A bounded wait degrades to a normal
+// real-frame present instead of hanging, and after a few timeouts we disable
+// framegen for this swapchain entirely so the app runs at full speed.
+static constexpr uint64_t kFenceTimeoutNs   = 250000000ull; // 250 ms
+static constexpr uint32_t kMaxFenceTimeouts = 2;
+
+static void noteFenceTimeout(SwapState& st) {
+    if (++st.fenceTimeouts >= kMaxFenceTimeouts && st.conf.enabled) {
+        st.conf.enabled = false;
+        BFG_LAYER_E("disabling framegen for this swapchain after %u fence timeouts "
+                    "(present-path sync incompatible with this ICD); real frames only",
+                    st.fenceTimeouts);
+    }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
         VkQueue queue,
         const VkPresentInfoKHR* pPresentInfo) {
@@ -1122,6 +1193,25 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
         }
     }
 
+    // Base frame-rate limiter. Paces the REAL game frame here, before any interpolated
+    // frames are injected below, so with framegen N× the on-screen rate is fps_limit × N
+    // (GameHub/LSFG semantics: cap the base, let framegen multiply it). Applies in pure
+    // passthrough too (framegen off) for a plain live fps cap. Only on real frames
+    // (inPresent == false); injected generated-frame presents must not be paced.
+    if (!st.inPresent && st.conf.fpsLimit > 0) {
+        const int64_t targetNs = 1000000000LL / st.conf.fpsLimit;
+        const int64_t now = nowNs();
+        if (st.lastPresentNs != 0 && now < st.lastPresentNs + targetNs) {
+            const int64_t due = st.lastPresentNs + targetNs;
+            sleepUntilNs(due);
+            st.lastPresentNs = due;          // anchor to schedule to avoid drift
+        } else {
+            st.lastPresentNs = now;          // first frame or we're already behind
+        }
+    } else if (st.conf.fpsLimit <= 0) {
+        st.lastPresentNs = 0;                // reset so re-enabling starts clean
+    }
+
     if (st.inPresent || !st.conf.enabled || !st.fgCtx)
         return callNextPresent(queue, pPresentInfo);
     if (imgIdx >= st.images.size()) {
@@ -1155,8 +1245,13 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
     // --- Step 1: Copy real swapchain image into current AHB input. The copy
     // waits on the application's original present semaphores, so the final real
     // present must not wait on those same binary semaphores again.
-    if (dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, UINT64_MAX) != VK_SUCCESS ||
-        dd.resetFences(device, 1, &st.copyFences[fi]) != VK_SUCCESS) {
+    VkResult copyPreWait = dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, kFenceTimeoutNs);
+    if (copyPreWait == VK_TIMEOUT) {
+        BFG_LAYER_E("copy fence (pre-submit) wait timed out; passing through");
+        noteFenceTimeout(st);
+        return callNextPresent(queue, pPresentInfo);
+    }
+    if (copyPreWait != VK_SUCCESS || dd.resetFences(device, 1, &st.copyFences[fi]) != VK_SUCCESS) {
         BFG_LAYER_E("copy fence wait/reset failed; passing through");
         return callNextPresent(queue, pPresentInfo);
     }
@@ -1234,11 +1329,17 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
         finalPresent.pWaitSemaphores = nullptr;
     }
 
-    VkResult copyWait = dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, UINT64_MAX);
+    VkResult copyWait = dd.waitForFences(device, 1, &st.copyFences[fi], VK_TRUE, kFenceTimeoutNs);
     if (copyWait != VK_SUCCESS) {
-        BFG_LAYER_E("copy fence wait failed after submit: %d", copyWait);
+        if (copyWait == VK_TIMEOUT) {
+            BFG_LAYER_E("copy fence (post-submit) wait timed out; presenting real frame only");
+            noteFenceTimeout(st);
+        } else {
+            BFG_LAYER_E("copy fence wait failed after submit: %d", copyWait);
+        }
         return dd.queuePresent(queue, &finalPresent);
     }
+    st.fenceTimeouts = 0;   // cross-context sync is working this frame
 
     // --- Step 2: Run framegen after we have both previous and current inputs.
     if (st.frameCount > 0) {
@@ -1267,7 +1368,11 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
                 continue;
             }
 
-            dd.waitForFences(device, 1, &st.genFences[k], VK_TRUE, UINT64_MAX);
+            if (dd.waitForFences(device, 1, &st.genFences[k], VK_TRUE, kFenceTimeoutNs) != VK_SUCCESS) {
+                BFG_LAYER_E("generated-frame fence wait timed out; skipping injected frame %d", k);
+                noteFenceTimeout(st);
+                continue;
+            }
             dd.resetFences(device, 1, &st.genFences[k]);
             VkCommandBuffer genCmd = st.genCmds[k];
             dd.resetCmdBuf(genCmd, 0);

@@ -188,6 +188,7 @@ static Pass makeModel1Pass(const vk::Device& dev,
 
 #ifdef __ANDROID__
 std::unique_ptr<FramegenContext> FramegenContext::create(
+        const vk::Device& device,
         AHardwareBuffer* prevAhb, AHardwareBuffer* currAhb,
         const std::vector<AHardwareBuffer*>& outputAhbs,
         VkExtent2D extent, VkFormat format, const Config& cfg) {
@@ -210,7 +211,13 @@ std::unique_ptr<FramegenContext> FramegenContext::create(
             BFG_LOGI("model=1 requested: using traced 100-dispatch graph (shader_03, 30..53, final 04), not model-0 hybrid fallback");
         }
 
-        ctx->device_        = vk::Device::create();
+        // Single-device mode: adopt the application's device (not owned) instead
+        // of spinning up a standalone instance/device. All vk:: helpers call
+        // global vkXxx routed by handle, and the layer hooks none of the
+        // functions they use, so they operate on the app device with no
+        // recursion — and the AHB producer/consumer are now one device, so the
+        // sync that previously deadlocked across two devices resolves.
+        ctx->device_        = device;
         ctx->cmdPool_       = vk::CommandPool(ctx->device_);
         ctx->linearSampler_ = vk::Sampler(ctx->device_, VK_FILTER_LINEAR,
                                            VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER);
