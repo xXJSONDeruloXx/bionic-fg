@@ -79,14 +79,26 @@ static void* dispatchKey(void* h) { return *reinterpret_cast<void**>(h); }
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 struct LayerConf {
-    bool        enabled    = false;
-    int         multiplier = 2;
-    float       flowScale  = 0.6f;
-    int         model      = 0;
-    int         fpsLimit   = 0;     // base real-frame cap (0 = off, else 10-200). Paces real
-                                    // frames BEFORE interpolation, so on-screen fps = limit × multiplier.
+    bool        enabled         = false;
+    int         multiplier      = 2;
+    float       flowScale       = 0.6f;
+    int         model           = 0;
+    bool        fpsLimitEnabled = false;  // whether the base cap below is applied
+    int         fpsLimit        = 0;      // remembered base real-frame cap (any positive value; the
+                                          // 10-200 range is a frontend convenience, NOT enforced here).
+                                          // Paces real frames BEFORE interpolation, so on-screen fps =
+                                          // limit × multiplier. conf.toml stays the source of truth, so
+                                          // the value is remembered even while the limiter is toggled off.
+    bool        deriveSyncTimeout = false;// opt-in: derive the sync-incompatibility timeout from the
+                                          // frame budget instead of the fixed fallback (footgun at init,
+                                          // so off by default).
+    bool        evenPaceGenerated = false;// opt-in: evenly pace generated presents to 1s/(base × mult)
+                                          // instead of firing them right after the real frame.
     std::string configPath;
     int64_t     configStamp = 0;
+
+    // Effective base cap actually applied this frame (0 = no cap).
+    int effectiveFpsLimit() const { return (fpsLimitEnabled && fpsLimit > 0) ? fpsLimit : 0; }
 };
 
 static constexpr int kMaxHotReloadMultiplier = 4;
@@ -184,6 +196,7 @@ static void parseConfigFile(const std::string& path, LayerConf& c) {
     if (!in) return;
 
     bool sawEnabled = false;
+    bool sawFpsEnabled = false;
     std::string line;
     while (std::getline(in, line)) {
         line = trim(stripComment(line));
@@ -208,12 +221,24 @@ static void parseConfigFile(const std::string& path, LayerConf& c) {
                 c.model = std::max(0, std::min(1, std::atoi(unquote(value).c_str())));
             } else if (key == "fps_limit" || key == "fpslimit") {
                 int v = std::atoi(unquote(value).c_str());
-                c.fpsLimit = (v <= 0) ? 0 : std::max(10, std::min(200, v));
+                c.fpsLimit = (v <= 0) ? 0 : v;   // respect any positive value; the UI owns the range
+            } else if (key == "fps_limit_enabled" || key == "fpslimitenabled") {
+                c.fpsLimitEnabled = parseBool(value, c.fpsLimitEnabled);
+                sawFpsEnabled = true;
+            } else if (key == "derive_sync_timeout" || key == "derivesynctimeout") {
+                c.deriveSyncTimeout = parseBool(value, c.deriveSyncTimeout);
+            } else if (key == "even_pace" || key == "evenpace") {
+                c.evenPaceGenerated = parseBool(value, c.evenPaceGenerated);
             }
         } catch (...) {
             BFG_LAYER_E("Ignoring invalid config value: %s", line.c_str());
         }
     }
+
+    // Back-compat: a config that sets fps_limit but predates the explicit
+    // fps_limit_enabled flag is treated as enabled (a positive fps_limit was
+    // the prior "on" signal). Files written by the frontend always emit both.
+    if (!sawFpsEnabled) c.fpsLimitEnabled = (c.fpsLimit > 0);
 
     // If a config exists but omits enabled, keep the launch activation state.
     (void)sawEnabled;
@@ -234,7 +259,8 @@ static LayerConf readConf() {
         c.model = std::max(0, std::min(1, std::atoi(v)));
     if (auto* v = std::getenv("BIONIC_FG_FPS_LIMIT")) {
         int iv = std::atoi(v);
-        c.fpsLimit = (iv <= 0) ? 0 : std::max(10, std::min(200, iv));
+        c.fpsLimit = (iv <= 0) ? 0 : iv;        // respect any positive value; UI owns the range
+        c.fpsLimitEnabled = (c.fpsLimit > 0);   // env-set positive cap implies enabled
     }
 
     c.configPath = defaultConfigPath();
@@ -454,7 +480,9 @@ struct SwapState {
     // disabled once either reaches kMaxFenceTimeouts.
     uint32_t copyFenceTimeouts = 0;
     uint32_t genFenceTimeouts  = 0;
-    int64_t  lastPresentNs = 0;   // for the fps_limit base-frame pacer (CLOCK_MONOTONIC)
+    int64_t  lastPresentNs = 0;       // for the fps_limit base-frame pacer (CLOCK_MONOTONIC)
+    int64_t  lastRealPresentNs = 0;   // wall-clock of the previous REAL present (cadence EWMA input)
+    uint64_t baseIntervalEwmaNs = 0;  // EWMA of delivered real-frame intervals; 0 = no sample yet
 
     void cleanup(const DeviceData& dd, VkDevice dev) {
         if (dd.deviceWaitIdle) dd.deviceWaitIdle(dev);
@@ -1098,40 +1126,59 @@ static VkResult acquireGeneratedImage(const DeviceData& dd, VkDevice device,
 //
 // Two distinct concerns, deliberately kept separate:
 //  1. Sync incompatibility — the fence *never* signals. Detected by a GENEROUS
-//     timeout on the copy fences so a merely-slow frame (shader compilation,
+//     fixed timeout on the copy fences so a merely-slow frame (shader compilation,
 //     queue backlog) is not misclassified; after enough CONSECUTIVE timeouts we
 //     disable framegen for the swapchain to stop wasting time on a hopelessly
-//     broken path. The timeout scales off the frame budget when a base fps limit
-//     is set, else a fixed fallback.
+//     broken path. The fixed fallback is the DEFAULT; deriving the bound from the
+//     frame budget is opt-in (derive_sync_timeout) because at init — before the
+//     swapchain settles and before the fps limit may even be known — a derived
+//     bound is unreliable (a footgun, as flagged in review).
 //  2. Generated-frame cadence — a generated frame is merely late. When a base
 //     fps limit is set, generated frames get a SHORTER deadline derived from the
-//     target output-frame interval; a late one is simply skipped to hold pace and
-//     is NOT counted as a sync failure.
-static constexpr uint64_t kSyncFenceTimeoutNoLimitNs = 500000000ull; // 500ms when no fps limit
+//     MEASURED base-frame interval (a cap is a ceiling, not a promise on base
+//     perf) with a tolerance band, so a slightly-late frame is still presented
+//     (slightly off-pace beats a hard skip) and only a big overrun is skipped to
+//     hold pace. A cadence miss is NOT counted as a sync failure.
+static constexpr uint64_t kSyncFenceTimeoutNoLimitNs = 500000000ull; // 500ms fixed fallback
 static constexpr uint64_t kSyncFenceTimeoutMinNs     = 200000000ull; // 200ms floor
 static constexpr uint64_t kSyncFenceTimeoutMaxNs     = 1000000000ull;// 1s cap
 static constexpr uint32_t kMaxFenceTimeouts          = 6;  // consecutive before disabling framegen
+// Cadence tolerance: allow a generated frame up to 1.5x its target output
+// interval before skipping it (numerator/denominator to avoid float math).
+static constexpr uint64_t kGenDeadlineSlackNum       = 3;
+static constexpr uint64_t kGenDeadlineSlackDen       = 2;
 
-// Generous "is the sync path stuck?" bound: ~4 base-frame intervals when an fps
-// limit is set (clamped), else a fixed fallback.
+// Generous "is the sync path stuck?" bound. Fixed fallback by default; only when
+// derive_sync_timeout is opted-in AND a base cap is set does it scale to ~4
+// base-frame intervals (clamped).
 static uint64_t syncFenceTimeoutNs(const LayerConf& c) {
-    if (c.fpsLimit <= 0) return kSyncFenceTimeoutNoLimitNs;
-    uint64_t budget = 1000000000ull / (uint64_t)c.fpsLimit;   // one base-frame interval
+    int lim = c.effectiveFpsLimit();
+    if (!c.deriveSyncTimeout || lim <= 0) return kSyncFenceTimeoutNoLimitNs;
+    uint64_t budget = 1000000000ull / (uint64_t)lim;          // one base-frame interval
     uint64_t t = budget * 4;
     if (t < kSyncFenceTimeoutMinNs) t = kSyncFenceTimeoutMinNs;
     if (t > kSyncFenceTimeoutMaxNs) t = kSyncFenceTimeoutMaxNs;
     return t;
 }
 
-// Shorter per-generated-frame "keep cadence" deadline: ~2x the target output
-// interval (1s / (base_fps * multiplier)). Returns 0 when no fps limit is set,
-// meaning "no cadence deadline — fall back to the sync bound". Never exceeds the
-// sync timeout.
-static uint64_t genFrameDeadlineNs(const LayerConf& c) {
-    if (c.fpsLimit <= 0) return 0;
+// Per-generated-frame "keep cadence" deadline. Returns 0 when no base cap is set
+// (no cadence target -> fall back to the sync bound). When a cap is set, the
+// target output interval is derived from the MEASURED recent base interval
+// (EWMA) divided by the multiplier, then widened by a tolerance slack so real
+// base variance doesn't cause needless skips. Never exceeds the sync bound.
+static uint64_t genFrameDeadlineNs(const SwapState& st) {
+    const LayerConf& c = st.conf;
+    int lim = c.effectiveFpsLimit();
+    if (lim <= 0) return 0;                                   // no cadence target without a cap
     uint64_t mult = (uint64_t)std::max(1, c.multiplier);
-    uint64_t outInterval = 1000000000ull / ((uint64_t)c.fpsLimit * mult);
-    uint64_t d = outInterval * 2;
+    // Prefer the measured base interval so the deadline tracks REAL base perf
+    // (the cap is a ceiling, not a guarantee); fall back to nominal 1s/limit
+    // until we have a sample.
+    uint64_t baseInterval = (st.baseIntervalEwmaNs > 0)
+        ? st.baseIntervalEwmaNs
+        : (1000000000ull / (uint64_t)lim);
+    uint64_t outInterval = baseInterval / mult;
+    uint64_t d = outInterval * kGenDeadlineSlackNum / kGenDeadlineSlackDen;
     if (d < 1000000ull) d = 1000000ull;                       // 1ms floor
     uint64_t cap = syncFenceTimeoutNs(c);
     if (d > cap) d = cap;
@@ -1246,8 +1293,9 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
     // (GameHub/LSFG semantics: cap the base, let framegen multiply it). Applies in pure
     // passthrough too (framegen off) for a plain live fps cap. Only on real frames
     // (inPresent == false); injected generated-frame presents must not be paced.
-    if (!st.inPresent && st.conf.fpsLimit > 0) {
-        const int64_t targetNs = 1000000000LL / st.conf.fpsLimit;
+    const int effFpsLimit = st.conf.effectiveFpsLimit();
+    if (!st.inPresent && effFpsLimit > 0) {
+        const int64_t targetNs = 1000000000LL / effFpsLimit;
         const int64_t now = nowNs();
         if (st.lastPresentNs != 0 && now < st.lastPresentNs + targetNs) {
             const int64_t due = st.lastPresentNs + targetNs;
@@ -1256,8 +1304,23 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
         } else {
             st.lastPresentNs = now;          // first frame or we're already behind
         }
-    } else if (st.conf.fpsLimit <= 0) {
+    } else if (effFpsLimit <= 0) {
         st.lastPresentNs = 0;                // reset so re-enabling starts clean
+    }
+
+    // Track the DELIVERED real-frame interval (sampled after any pacing sleep, so
+    // it reflects true on-device base cadence — which a cap doesn't guarantee) as
+    // an EWMA. Feeds the generated-frame cadence deadline so it tolerates real
+    // base variance instead of assuming the nominal 1s/limit.
+    if (!st.inPresent) {
+        const int64_t nowReal = nowNs();
+        if (st.lastRealPresentNs != 0 && nowReal > st.lastRealPresentNs) {
+            const uint64_t delta = (uint64_t)(nowReal - st.lastRealPresentNs);
+            st.baseIntervalEwmaNs = (st.baseIntervalEwmaNs == 0)
+                ? delta
+                : (st.baseIntervalEwmaNs * 7 + delta) / 8;   // EWMA, alpha = 1/8
+        }
+        st.lastRealPresentNs = nowReal;
     }
 
     if (st.inPresent || !st.conf.enabled || !st.fgCtx)
@@ -1422,7 +1485,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
             // NOT a sync failure; only a timeout at the full sync bound counts toward
             // disabling framegen.
             const uint64_t genSyncBound = syncFenceTimeoutNs(st.conf);
-            const uint64_t genDeadline  = genFrameDeadlineNs(st.conf);
+            const uint64_t genDeadline  = genFrameDeadlineNs(st);
             const uint64_t genWait      = (genDeadline > 0) ? genDeadline : genSyncBound;
             if (dd.waitForFences(device, 1, &st.genFences[k], VK_TRUE, genWait) != VK_SUCCESS) {
                 if (genDeadline > 0 && genDeadline < genSyncBound) {
@@ -1506,6 +1569,17 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
             genPresent.swapchainCount     = 1;
             genPresent.pSwapchains        = &swapchain;
             genPresent.pImageIndices      = &genIdx;
+
+            // Optional even pacing (opt-in, base limiter active only): space the
+            // generated presents across the base interval at the target output
+            // interval 1s/(base × mult) — anchored on the paced real frame — rather
+            // than firing them back-to-back right after it. Off by default because
+            // explicit sleeps can add latency or fight the swapchain present mode.
+            if (st.conf.evenPaceGenerated && effFpsLimit > 0 && st.lastPresentNs != 0) {
+                const int64_t outInterval =
+                    1000000000LL / ((int64_t)effFpsLimit * std::max(1, st.conf.multiplier));
+                sleepUntilNs(st.lastPresentNs + (int64_t)(k + 1) * outInterval);
+            }
             dd.queuePresent(queue, &genPresent);
         }
     }
