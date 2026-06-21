@@ -480,6 +480,13 @@ struct SwapState {
     // disabled once either reaches kMaxFenceTimeouts.
     uint32_t copyFenceTimeouts = 0;
     uint32_t genFenceTimeouts  = 0;
+    // Sticky, runtime-only kill switch: once the present-path proves sync-
+    // incompatible with this ICD we passthrough for the rest of THIS swapchain's
+    // life. Kept separate from conf.enabled (which the file owns) so a conf.toml
+    // hot-reload — e.g. nudging the flow slider in-game — can't silently re-arm
+    // a path we already gave up on. The clean re-attempt point is a swapchain
+    // recreate, which builds a fresh SwapState with this defaulted back to false.
+    bool     framegenForceDisabled = false;
     int64_t  lastPresentNs = 0;       // for the fps_limit base-frame pacer (CLOCK_MONOTONIC)
     int64_t  lastRealPresentNs = 0;   // wall-clock of the previous REAL present (cadence EWMA input)
     uint64_t baseIntervalEwmaNs = 0;  // EWMA of delivered real-frame intervals; 0 = no sample yet
@@ -1189,10 +1196,12 @@ static uint64_t genFrameDeadlineNs(const SwapState& st) {
 // swapchain once it reaches the threshold. Counters are independent so a
 // healthy copy path can't reset a stuck generated-frame path.
 static void noteFenceTimeout(SwapState& st, uint32_t& counter, const char* which) {
-    if (++counter >= kMaxFenceTimeouts && st.conf.enabled) {
+    if (++counter >= kMaxFenceTimeouts && !st.framegenForceDisabled) {
+        st.framegenForceDisabled = true;
         st.conf.enabled = false;
         BFG_LAYER_E("disabling framegen for this swapchain after %u consecutive %s fence "
-                    "timeouts (present-path sync incompatible with this ICD); real frames only",
+                    "timeouts (present-path sync incompatible with this ICD); real frames only "
+                    "for the rest of this swapchain (a conf hot-reload will NOT re-enable it)",
                     counter, which);
     }
 }
@@ -1323,7 +1332,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BionicFG_QueuePresentKHR(
         st.lastRealPresentNs = nowReal;
     }
 
-    if (st.inPresent || !st.conf.enabled || !st.fgCtx)
+    if (st.inPresent || st.framegenForceDisabled || !st.conf.enabled || !st.fgCtx)
         return callNextPresent(queue, pPresentInfo);
     if (imgIdx >= st.images.size()) {
         BFG_LAYER_E("present image index %u out of range (%zu); passing through", imgIdx, st.images.size());
