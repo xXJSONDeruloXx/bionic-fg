@@ -56,7 +56,12 @@ public:
     FramegenContext() = default;
 
 #ifdef __ANDROID__
+    // `device` is the application's own VkDevice (wrapped, not owned). Running
+    // the interpolation on the SAME device the swapchain/AHBs live on avoids the
+    // cross-device fence deadlock that hangs a standalone second device on
+    // wrapper-ICD stacks (Winlator/Turnip). See BIONIC_FG_INTEGRATION_REPORT.md.
     static std::unique_ptr<FramegenContext> create(
+        const vk::Device& device,
         AHardwareBuffer* prevAhb,
         AHardwareBuffer* currAhb,
         const std::vector<AHardwareBuffer*>& outputAhbs,

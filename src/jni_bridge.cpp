@@ -136,7 +136,10 @@ Java_io_github_bionicfg_BionicFGNative_nativeCreateContext(
     extent.width  = static_cast<uint32_t>(width);
     extent.height = static_cast<uint32_t>(height);
 
+    // Standalone JNI test path: create our own device (owned). The Vulkan-layer
+    // path instead passes the application's wrapped device (single-device mode).
     auto ctx = bionic_fg::FramegenContext::create(
+        bionic_fg::vk::Device::create(),
         prevBuf, currBuf, outBufs, extent, VK_FORMAT_R8G8B8A8_UNORM, cfg);
     if (!ctx) { BFG_LOGE("nativeCreateContext: FramegenContext::create failed"); return 0L; }
     return bionic_fg::ctxToHandle(ctx.release());

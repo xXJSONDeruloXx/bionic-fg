@@ -11,8 +11,12 @@
             "vkGetInstanceProcAddr": "BionicFG_GetInstanceProcAddr",
             "vkGetDeviceProcAddr":   "BionicFG_GetDeviceProcAddr"
         },
+        "comment": "disable_environment is REQUIRED by the Vulkan loader for implicit layers (without it the layer is skipped as malformed); it is not a second toggle. Precedence is the loader's own: if BIONIC_FG_DISABLE is set the layer is forced off regardless of BIONIC_FG_ENABLE. Normal use leaves BIONIC_FG_DISABLE unset and gates purely on BIONIC_FG_ENABLE.",
         "enable_environment": {
             "BIONIC_FG_ENABLE": "1"
+        },
+        "disable_environment": {
+            "BIONIC_FG_DISABLE": "1"
         }
     }
 }

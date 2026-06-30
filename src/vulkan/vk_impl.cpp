@@ -10,10 +10,10 @@ namespace bionic_fg::vk {
 
 // ─── Utils ───────────────────────────────────────────────────────────────────
 
-uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeBits,
+uint32_t findMemoryType(const Device& dev, uint32_t typeBits,
                         VkMemoryPropertyFlags props) {
     VkPhysicalDeviceMemoryProperties memProps;
-    vkGetPhysicalDeviceMemoryProperties(phys, &memProps);
+    dev.memPropsFn()(dev.physical(), &memProps);
     for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
         if ((typeBits & (1u << i)) &&
             (memProps.memoryTypes[i].propertyFlags & props) == props) {
@@ -34,8 +34,12 @@ static const char* kRequiredDeviceExts[] = {
     "VK_KHR_get_memory_requirements2",
     "VK_KHR_bind_memory2",
     "VK_KHR_maintenance1",
-    "VK_KHR_external_memory_capabilities",
-    "VK_KHR_get_physical_device_properties2",
+    // NOTE: VK_KHR_external_memory_capabilities and
+    // VK_KHR_get_physical_device_properties2 are *instance* extensions (and core
+    // since Vulkan 1.1) — they are enabled on the instance below, not the device.
+    // Listing them here made vkEnumerateDeviceExtensionProperties always report
+    // them missing ("Device ext not available"); harmless (they were filtered
+    // out before vkCreateDevice) but misleading, so they are removed.
 #endif
 };
 
@@ -149,7 +153,8 @@ Device Device::create() {
 }
 
 Device Device::wrap(VkInstance inst, VkPhysicalDevice phys, VkDevice dev,
-                    uint32_t computeFamily, VkQueue queue) {
+                    uint32_t computeFamily, VkQueue queue,
+                    PFN_vkGetPhysicalDeviceMemoryProperties memPropsFn) {
     Device d;
     d.owned_         = false;
     d.instance_      = inst;
@@ -157,6 +162,7 @@ Device Device::wrap(VkInstance inst, VkPhysicalDevice phys, VkDevice dev,
     d.device_        = dev;
     d.computeFamily_ = computeFamily;
     d.computeQueue_  = queue;
+    d.memPropsFn_    = memPropsFn;
     return d;
 }
 
@@ -192,7 +198,7 @@ Image::Image(const Device& dev, const ImageInfo& info) {
 
     VkMemoryRequirements memReq{};
     vkGetImageMemoryRequirements(dev.handle(), image_, &memReq);
-    uint32_t mt = findMemoryType(dev.physical(), memReq.memoryTypeBits,
+    uint32_t mt = findMemoryType(dev, memReq.memoryTypeBits,
                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     VkMemoryAllocateInfo mai{};
@@ -283,7 +289,7 @@ Image::Image(const Device& dev, const ImageInfo& info, AHardwareBuffer* ahb) {
     mai.memoryTypeIndex = 0;
     // find compatible mem type from AHB props
     VkPhysicalDeviceMemoryProperties memProps{};
-    vkGetPhysicalDeviceMemoryProperties(dev.physical(), &memProps);
+    dev.memPropsFn()(dev.physical(), &memProps);
     for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
         if (ahbProps.memoryTypeBits & (1u << i)) { mai.memoryTypeIndex = i; break; }
     }
@@ -344,7 +350,7 @@ Buffer::Buffer(const Device& dev, VkDeviceSize size, VkBufferUsageFlags usage,
 
     VkMemoryRequirements memReq{};
     vkGetBufferMemoryRequirements(dev.handle(), buffer_, &memReq);
-    uint32_t mt = findMemoryType(dev.physical(), memReq.memoryTypeBits,
+    uint32_t mt = findMemoryType(dev, memReq.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
     VkMemoryAllocateInfo mai{};
